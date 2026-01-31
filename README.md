@@ -68,6 +68,10 @@ To save replay file:
     - need correct targets
 
 - **`src/game_constants.py`**
+  - Game constants including:
+    - **COOK_PROGRESS = 20** turns (time to cook food from raw to cooked)
+    - **BURN_PROGRESS = 40** turns (time to burn food)
+    - Cooking stages: [0-19] raw, [20-39] cooked, [40+] burnt
 
 - **`src/map_processor.py`**
 

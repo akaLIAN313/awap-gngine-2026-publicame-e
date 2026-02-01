@@ -1157,6 +1157,14 @@ class Scheduler:
 
             # Create new DIYOrder and add to list (locations resolved at action time)
             diy_order = DIYOrder.from_api_order(order_dict)
+
+            # Skip unprofitable orders: if (reward - cost) < penalty, ignore
+            total_cost = sum(food.buy_cost for food in diy_order.required_foods)
+            profit = diy_order.reward - total_cost
+            if profit < diy_order.penalty:
+                self.known_order_ids.add(order_id)  # Mark as known to avoid re-processing
+                continue
+
             diy_order.calculate_priority(current_turn)
             self.orders.append(diy_order)
             self.known_order_ids.add(order_id)
@@ -1207,10 +1215,14 @@ class Scheduler:
         return None
 
     def start_order(self, order_id: int, start_location: Tuple[int, int] = None,
-                    bot_id: Optional[int] = None) -> bool:
+                    bot_id: Optional[int] = None, current_budget: int = 0) -> bool:
         """Start an order. If bot_id is given, assigns this order to that bot only."""
         order = self.get_order_by_id(order_id)
         if order and not order.start:
+            # Skip if total cost exceeds current budget
+            total_cost = sum(food.buy_cost for food in order.required_foods)
+            if total_cost > current_budget:
+                return False
             # Reserve counter
             reserve_flag = True
             if order.reserved_counter_pos is None and self.resource_manager:
@@ -1771,7 +1783,8 @@ class BotPlayer:
         if worker.current_order is None:
             order = self.scheduler.get_highest_pending_order()
             if order is not None:
-                if self.scheduler.start_order(order.order_id, (bx, by), bot_id):
+                current_budget = controller.get_team_money(controller.get_team())
+                if self.scheduler.start_order(order.order_id, (bx, by), bot_id, current_budget):
                     worker.clear_state()
                     worker.current_order = order
                     foods_str = ", ".join(

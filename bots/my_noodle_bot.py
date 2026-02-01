@@ -139,7 +139,8 @@ class RouteCalculator:
         """
         if not path:
             return False
-        self._reservations[bot_id] = {"path": list(path), "step": 0, "target": path[-1]}
+        self._reservations[bot_id] = {"path": list(
+            path), "step": 0, "target": path[-1]}
         return True
 
     def advance_round(self) -> None:
@@ -738,7 +739,7 @@ class Session:
                 Action(ActionType.TAKE_FROM_PAN),
                 Action(ActionType.TRASH),
             ],
-            priority=2  # Second highest priority - clear pan second
+            priority=1  # Second highest priority - clear pan second
         )
 
     @staticmethod
@@ -750,7 +751,7 @@ class Session:
                 Action(ActionType.PICKUP),
                 Action(ActionType.PLACE),
             ],
-            priority=2  # Second highest priority - clear plate second
+            priority=1  # Second highest priority - clear plate second
         )
 
     @staticmethod
@@ -762,7 +763,7 @@ class Session:
                 Action(ActionType.BUY, item_type=ShopCosts.PLATE),
                 Action(ActionType.PLACE),
             ],
-            priority=5  # After cooking starts, before adding food
+            priority=1  # After cooking starts, before adding food
         )
 
     @staticmethod
@@ -774,36 +775,9 @@ class Session:
                 Action(ActionType.PICKUP),
                 Action(ActionType.TRASH),
             ],
-            priority=6  # After cooking starts, before adding food
+            priority=2  # After cooking starts, before adding food
         )
-
-    @staticmethod
-    def create_buy_and_plate_simple(food_type: FoodType) -> 'Session':
-        """Create session: Buy food -> add to plate (no processing needed). Target coords set dynamically at action time."""
-        return Session(
-            session_type=SessionType.BUY_AND_PLATE_SIMPLE,
-            actions=[
-                Action(ActionType.BUY, food_type=food_type),
-                Action(ActionType.ADD_TO_PLATE),
-            ],
-            food_type=food_type,
-            priority=10  # Normal priority
-        )
-
-    @staticmethod
-    def create_buy_chop(food_type: FoodType) -> 'Session':
-        """Create session: Buy -> place -> chop. Target coords set dynamically at action time."""
-        return Session(
-            session_type=SessionType.BUY_CHOP,
-            actions=[
-                Action(ActionType.BUY, food_type=food_type),
-                Action(ActionType.PLACE),
-                Action(ActionType.CHOP),
-            ],
-            food_type=food_type,
-            priority=4
-        )
-
+    
     @staticmethod
     def create_buy_chop_and_cook(food_type: FoodType) -> 'Session':
         """Create session: Buy -> place -> chop -> pickup -> place in cooker. Target coords set dynamically at action time."""
@@ -819,7 +793,7 @@ class Session:
             food_type=food_type,
             priority=3  # High priority - start cooking early
         )
-
+    
     @staticmethod
     def create_buy_and_cook(food_type: FoodType) -> 'Session':
         """Create session: Buy -> place in cooker (no chop). Target coords set dynamically at action time."""
@@ -830,9 +804,9 @@ class Session:
                 Action(ActionType.PLACE),
             ],
             food_type=food_type,
-            priority=5  # High priority - start cooking early
+            priority=4  # High priority - start cooking early
         )
-
+    
     @staticmethod
     def create_take_and_plate_cooked(food_type: FoodType) -> 'Session':
         """Create session: Take from pan -> add to plate (when cooked). Target coords set dynamically at action time."""
@@ -844,7 +818,34 @@ class Session:
             ],
             food_type=food_type,
             available_after_turn=None,  # Will be set when cooking starts
-            priority=20  # Lower priority - do after other prep
+            priority=5  # Lower priority - do after other prep
+        )
+    
+    @staticmethod
+    def create_buy_chop(food_type: FoodType) -> 'Session':
+        """Create session: Buy -> place -> chop. Target coords set dynamically at action time."""
+        return Session(
+            session_type=SessionType.BUY_CHOP,
+            actions=[
+                Action(ActionType.BUY, food_type=food_type),
+                Action(ActionType.PLACE),
+                Action(ActionType.CHOP),
+            ],
+            food_type=food_type,
+            priority=6
+        )
+
+    @staticmethod
+    def create_buy_and_plate_simple(food_type: FoodType) -> 'Session':
+        """Create session: Buy food -> add to plate (no processing needed). Target coords set dynamically at action time."""
+        return Session(
+            session_type=SessionType.BUY_AND_PLATE_SIMPLE,
+            actions=[
+                Action(ActionType.BUY, food_type=food_type),
+                Action(ActionType.ADD_TO_PLATE),
+            ],
+            food_type=food_type,
+            priority=7  # Normal priority
         )
 
     @staticmethod
@@ -1392,7 +1393,7 @@ class BotPlayer:
         if self.route_calc.has_reservation(bot_id):
             if self.route_calc.has_reservation(bot_id, (target_x, target_y)):
                 self.route_calc.release_path(bot_id)
-        
+
         if not self.route_calc.has_reservation(bot_id, (target_x, target_y)):
             success, path = self.route_calc.try_reserve_path(
                 bot_id, (bx, by), (target_x, target_y),
@@ -1476,8 +1477,17 @@ class BotPlayer:
         tx, ty = target
 
         if action.action_type == ActionType.BUY:
+            if action.item_type is not None:
+                buy_name = action.item_type.item_name
+            elif action.food_type is not None:
+                buy_name = action.food_type.food_name
+            else:
+                return False, "BUY failed: no item type specified"
+
+            if bot_info.get('holding') and bot_info.get('holding').get('type') == buy_name:
+                return True, f"BUY processed: bot is already holding {buy_name}"
             if bot_info.get('holding'):
-                return False, "BUY failed: bot is already holding something"
+                return False, f"BUY failed: bot is already holding {buy_name}"
             if self.move_towards(controller, bot_id, tx, ty):
                 if action.food_type:
                     cost = action.food_type.buy_cost
@@ -1497,6 +1507,12 @@ class BotPlayer:
             if not bot_info.get('holding'):
                 return False, "PLACE failed: bot is not holding anything"
             if self.move_towards(controller, bot_id, tx, ty):
+                # Hold a plate and the target is a counter
+                target_tile = controller.get_tile(
+                    team=controller.get_team(), x=tx, y=ty)
+                if bot_info.get('holding').get('type') == 'Plate' and target_tile.get('type') == 'COUNTER' and isinstance(target_tile.get('item'), Food):
+                    controller.add_food_to_plate(bot_id, tx, ty)
+                    return (False, "PLACE processes: food added to plate")
                 ok = controller.place(bot_id, tx, ty)
                 return (ok, f"PLACE at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
             return False, "PLACE failed: could not move to target"
@@ -1640,6 +1656,19 @@ class BotPlayer:
                 worker.in_ensure_pan_or_cooker = False
                 return False
             if self.move_towards(controller, bot_id, cx, cy):
+                # Food on the counter
+                target_tile = controller.get_tile(
+                    team=controller.get_team(), x=cx, y=cy)
+                if target_tile is None:
+                    return False, "PLACE failed: target tile not found"
+
+                if target_tile.item is not None:
+                    if isinstance(target_tile.item, Food):
+                        controller.add_food_to_plate(bot_id, cx, cy)
+                        return False, "PLACE processes: food added to plate"
+                    else:
+                        return False, "PLACE failed: target tile is not food"
+
                 if controller.place(bot_id, cx, cy):
                     worker.in_ensure_pan_or_cooker = False
                     return True
@@ -1755,7 +1784,8 @@ class BotPlayer:
                         self.scheduler.complete_order(order.order_id)
                         return
                     if not isinstance(plate_tile.item, Plate) or plate_tile.item.dirty:
-                        print(f"[Turn {turn}] Bot {bot_id}: Plate not ready at {cx}, {cy}")
+                        print(
+                            f"[Turn {turn}] Bot {bot_id}: Plate not ready at {cx}, {cy}")
                         worker.in_ensure_pan_or_cooker = True
                         self.ensure_plate_on_counter(
                             controller, bot_id, worker, order)
@@ -1776,9 +1806,11 @@ class BotPlayer:
                         and cooker_tile.item.food is None
                     )
                     if not has_empty_pan:
-                        print(f"[Turn {turn}] Bot {bot_id}: Pan not ready at {cx}, {cy}")
+                        print(
+                            f"[Turn {turn}] Bot {bot_id}: Pan not ready at {cx}, {cy}")
                         worker.in_ensure_pan_or_cooker = True
-                        self.ensure_pan_on_cooker(controller, bot_id, worker, order)
+                        self.ensure_pan_on_cooker(
+                            controller, bot_id, worker, order)
 
                 worker.current_session = session
 

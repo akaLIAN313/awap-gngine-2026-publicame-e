@@ -3,9 +3,10 @@ from typing import Tuple, Optional, List, Dict, Any, Set, Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from game_constants import FoodType, ShopCosts, GameConstants
+from game_constants import FoodType, ShopCosts, GameConstants, Team
 from robot_controller import RobotController
-from item import Pan, Plate
+from item import Pan, Plate, Food
+
 
 class RouteCalculator:
     """
@@ -16,7 +17,8 @@ class RouteCalculator:
     """
 
     # Neighbors for Chebyshev distance 1 (8-direction)
-    _NEIGHBORS = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if (dx, dy) != (0, 0)]
+    _NEIGHBORS = [(dx, dy) for dx in (-1, 0, 1)
+                  for dy in (-1, 0, 1) if (dx, dy) != (0, 0)]
 
     def __init__(self, width: int, height: int, is_walkable: Callable[[int, int], bool]):
         self._width = width
@@ -53,8 +55,10 @@ class RouteCalculator:
         blocked_cells: Optional[Set[Tuple[int, int]]] = None,
     ) -> Optional[List[Tuple[int, int]]]:
         """
-        BFS from start to end. A cell is passable if walkable and not in blocked_cells.
-        Returns full path [start, ..., end] or None if no path.
+        BFS from start towards end. Goal is to reach any walkable cell from which
+        the bot can touch end (i.e. on or adjacent to end). The end cell does not
+        need to be walkable. A cell is passable if walkable and not in blocked_cells.
+        Returns full path [start, ..., cell_that_touches_end] or None if no path.
         """
         if blocked_cells is None:
             blocked_cells = set()
@@ -62,12 +66,14 @@ class RouteCalculator:
         ex, ey = end
         if not self._in_bounds(sx, sy) or not self._in_bounds(ex, ey):
             return None
-        if not self._is_walkable(sx, sy) or not self._is_walkable(ex, ey):
+        if not self._is_walkable(sx, sy):
             return None
-        if (sx, sy) == (ex, ey):
+        # Already at or adjacent to end (can touch it)
+        if max(abs(sx - ex), abs(sy - ey)) <= 1:
             return [start]
 
-        queue: deque[Tuple[Tuple[int, int], List[Tuple[int, int]]]] = deque([(start, [start])])
+        queue: deque[Tuple[Tuple[int, int], List[Tuple[int, int]]]] = deque([
+                                                                            (start, [start])])
         visited: Set[Tuple[int, int]] = {start}
 
         while queue:
@@ -80,7 +86,8 @@ class RouteCalculator:
                     continue
                 visited.add((nx, ny))
                 new_path = path + [(nx, ny)]
-                if (nx, ny) == (ex, ey):
+                # Reached a cell from which we can touch end (on or adjacent)
+                if max(abs(nx - ex), abs(ny - ey)) <= 1:
                     return new_path
                 queue.append(((nx, ny), new_path))
         return None
@@ -90,13 +97,17 @@ class RouteCalculator:
         start: Tuple[int, int],
         end: Tuple[int, int],
         exclude_bot_id: Optional[int] = None,
+        extra_blocked_cells: Optional[Set[Tuple[int, int]]] = None,
     ) -> Tuple[bool, Optional[List[Tuple[int, int]]]]:
         """
-        Check if a path exists from start to end given current reservations.
+        Check if a path exists from start to end given current reservations
+        and extra blocked cells (e.g. other robots' positions).
         exclude_bot_id: when computing for one robot, ignore its own reservation.
         Returns (True, path) or (False, None).
         """
         blocked = self.get_reserved_cells(exclude_bot_id=exclude_bot_id)
+        if extra_blocked_cells:
+            blocked = blocked | extra_blocked_cells
         path = self.find_path(start, end, blocked_cells=blocked)
         return (path is not None, path)
 
@@ -105,16 +116,20 @@ class RouteCalculator:
         bot_id: int,
         start: Tuple[int, int],
         end: Tuple[int, int],
+        extra_blocked_cells: Optional[Set[Tuple[int, int]]] = None,
     ) -> Tuple[bool, Optional[List[Tuple[int, int]]]]:
         """
-        Find a path from start to end considering other robots' reservations.
+        Find a path from start to end considering other robots' reservations
+        and extra blocked cells (e.g. other robots' positions).
         If a path exists, reserve it for bot_id and return (True, path).
         If not accessible, return (False, None) — caller should give up.
         """
-        ok, path = self.can_reach(start, end, exclude_bot_id=bot_id)
+        ok, path = self.can_reach(
+            start, end, exclude_bot_id=bot_id, extra_blocked_cells=extra_blocked_cells
+        )
         if not ok or path is None:
             return (False, None)
-        self._reservations[bot_id] = {"path": path, "step": 0}
+        self._reservations[bot_id] = {"path": path, "step": 0, "target": end}
         return (True, path)
 
     def reserve_path(self, bot_id: int, path: List[Tuple[int, int]]) -> bool:
@@ -124,7 +139,7 @@ class RouteCalculator:
         """
         if not path:
             return False
-        self._reservations[bot_id] = {"path": list(path), "step": 0}
+        self._reservations[bot_id] = {"path": list(path), "step": 0, "target": path[-1]}
         return True
 
     def advance_round(self) -> None:
@@ -160,16 +175,427 @@ class RouteCalculator:
         """Remove reservation for bot_id (e.g. when giving up)."""
         self._reservations.pop(bot_id, None)
 
-    def has_reservation(self, bot_id: int) -> bool:
-        return bot_id in self._reservations
+    def has_reservation(
+        self, bot_id: int, target: Optional[Tuple[int, int]] = None
+    ) -> bool:
+        """True if bot has a reservation; if target is given, also requires it matches the reserved target."""
+        if bot_id not in self._reservations:
+            return False
+        if target is None:
+            return True
+        return self._reservations[bot_id].get("target") == target
 
     def is_cell_reserved(self, x: int, y: int, exclude_bot_id: Optional[int] = None) -> bool:
         return (x, y) in self.get_reserved_cells(exclude_bot_id=exclude_bot_id)
 
 
+# ---------------------------------------------------------------------------
+# ResourceManager: discover resources, track status, apply/release for exclusive use.
+# Call update() once per turn (before bots act) to refresh status and auto-release.
+# ---------------------------------------------------------------------------
+
+class CounterStatus(Enum):
+    """Status of a counter tile."""
+    EMPTY = "empty"           # No item on counter
+    HAS_FOOD = "has_food"     # Raw food (for chop)
+    HAS_PLATE = "has_plate"   # Plate (possibly with food)
+    HAS_OTHER = "has_other"   # Other items (e.g. pan)
+
+
+class CookerStatus(Enum):
+    """Status of a cooker tile (based on pan and food state)."""
+    NO_PAN = "no_pan"         # Pan missing (accidentally removed)
+    PAN_EMPTY = "pan_empty"   # Pan present, no food
+    RAW_FOOD = "raw_food"     # Raw food in pan, cooking
+    COOKED = "cooked"         # Food ready to take (cooked_stage == 1)
+    BURNT = "burnt"           # Food burnt (cooked_stage == 2)
+
+
+def _chebyshev_dist(ax: int, ay: int, bx: int, by: int) -> int:
+    """Chebyshev (king move) distance."""
+    return max(abs(ax - bx), abs(ay - by))
+
+
+# 8-direction neighbors (Chebyshev / king move)
+_BFS_NEIGHBORS = [(dx, dy) for dx in (-1, 0, 1)
+                  for dy in (-1, 0, 1) if (dx, dy) != (0, 0)]
+
+
+class ResourceManager:
+    """
+    Manages cookers and counters: discovers locations, tracks status, and provides
+    apply/release semantics so bots request exclusive use before interacting.
+    - apply_* returns closest available resource (if applier_location given) or first available
+    - Optional time_limit: auto-release after that many turns
+    """
+
+    def __init__(self):
+        # (x, y) -> position of each resource
+        self._cookers: List[Tuple[int, int]] = []
+        self._counters: List[Tuple[int, int]] = []
+        # Positions that are held (no owner tracked)
+        self._cooker_held: Set[Tuple[int, int]] = set()
+        self._counter_held: Set[Tuple[int, int]] = set()
+        # (x, y) -> {"applied_turn": int, "time_limit": Optional[int]}
+        self._counter_hold_meta: Dict[Tuple[int, int], dict] = {}
+        self._cooker_hold_meta: Dict[Tuple[int, int], dict] = {}
+        # Cached status (updated each turn via update())
+        self._cooker_status: Dict[Tuple[int, int], CookerStatus] = {}
+        self._counter_status: Dict[Tuple[int, int], CounterStatus] = {}
+        self._current_turn: int = 0
+        # Map for BFS (no robot blocking) - updated each turn
+        self._width: int = 0
+        self._height: int = 0
+        self._is_walkable: Optional[Callable[[int, int], bool]] = None
+
+    def discover_resources(self, controller: RobotController) -> None:
+        """
+        Scan the map for all cookers and counters. Call once at the beginning.
+        """
+        self._cookers.clear()
+        self._counters.clear()
+        self._cooker_held.clear()
+        self._counter_held.clear()
+        self._counter_hold_meta.clear()
+        self._cooker_hold_meta.clear()
+        self._cooker_status.clear()
+        self._counter_status.clear()
+
+        m = controller.get_map(controller.get_team())
+        self._width = m.width
+        self._height = m.height
+        self._is_walkable = m.is_tile_walkable
+        for x in range(m.width):
+            for y in range(m.height):
+                tile = m.tiles[x][y]
+                if tile.tile_name == "COOKER":
+                    self._cookers.append((x, y))
+                elif tile.tile_name == "COUNTER":
+                    self._counters.append((x, y))
+
+    def update(self, controller: RobotController) -> None:
+        """
+        Call once per game turn (before bots act). Refreshes status from the actual
+        tile state, auto-releases when time limit is reached, and auto-releases
+        cookers when burnt or pan is missing. Also updates map for BFS accessibility.
+        """
+        self._current_turn = controller.get_turn()
+        team = controller.get_team()
+        m = controller.get_map(team)
+        self._width = m.width
+        self._height = m.height
+        self._is_walkable = m.is_tile_walkable
+        for pos in self._cookers:
+            self._update_cooker_status(controller, team, pos)
+            self._maybe_auto_release_cooker_by_time(pos)
+            self._maybe_auto_release_cooker(pos)
+        for pos in self._counters:
+            self._update_counter_status(controller, team, pos)
+            self._maybe_auto_release_counter_by_time(pos)
+
+    def _update_cooker_status(self, controller: RobotController, team: Team, pos: Tuple[int, int]) -> None:
+        tile = controller.get_tile(team, pos[0], pos[1])
+        if tile is None:
+            self._cooker_status[pos] = CookerStatus.NO_PAN
+            return
+        item = getattr(tile, "item", None)
+        if not isinstance(item, Pan):
+            self._cooker_status[pos] = CookerStatus.NO_PAN
+            return
+        if item.food is None:
+            self._cooker_status[pos] = CookerStatus.PAN_EMPTY
+            return
+        food = item.food
+        if food.cooked_stage == 2:
+            self._cooker_status[pos] = CookerStatus.BURNT
+        elif food.cooked_stage == 1:
+            self._cooker_status[pos] = CookerStatus.COOKED
+        else:
+            self._cooker_status[pos] = CookerStatus.RAW_FOOD
+
+    def _update_counter_status(self, controller: RobotController, team: Team, pos: Tuple[int, int]) -> None:
+        tile = controller.get_tile(team, pos[0], pos[1])
+        if tile is None:
+            self._counter_status[pos] = CounterStatus.EMPTY
+            return
+        item = getattr(tile, "item", None)
+        if item is None:
+            self._counter_status[pos] = CounterStatus.EMPTY
+            return
+        if isinstance(item, Food):
+            self._counter_status[pos] = CounterStatus.HAS_FOOD
+        elif isinstance(item, Plate):
+            self._counter_status[pos] = CounterStatus.HAS_PLATE
+        else:
+            self._counter_status[pos] = CounterStatus.HAS_OTHER
+
+    def _maybe_auto_release_cooker(self, pos: Tuple[int, int]) -> None:
+        """Auto-release cooker when burnt or pan is missing."""
+        status = self._cooker_status.get(pos, CookerStatus.NO_PAN)
+        if status in (CookerStatus.BURNT, CookerStatus.NO_PAN):
+            self._cooker_held.discard(pos)
+            self._cooker_hold_meta.pop(pos, None)
+
+    def _maybe_auto_release_cooker_by_time(self, pos: Tuple[int, int]) -> None:
+        """Auto-release cooker when time limit is reached."""
+        meta = self._cooker_hold_meta.get(pos)
+        if meta is None:
+            return
+        limit = meta.get("time_limit")
+        if limit is None:
+            return
+        if (self._current_turn - meta["applied_turn"]) >= limit:
+            self._cooker_held.discard(pos)
+            self._cooker_hold_meta.pop(pos, None)
+
+    def _maybe_auto_release_counter_by_time(self, pos: Tuple[int, int]) -> None:
+        """Auto-release counter when time limit is reached."""
+        meta = self._counter_hold_meta.get(pos)
+        if meta is None:
+            return
+        limit = meta.get("time_limit")
+        if limit is None:
+            return
+        if (self._current_turn - meta["applied_turn"]) >= limit:
+            self._counter_held.discard(pos)
+            self._counter_hold_meta.pop(pos, None)
+
+    def _bfs_distance_to_resource(
+        self, from_pos: Tuple[int, int], resource_pos: Tuple[int, int]
+    ) -> Optional[int]:
+        """
+        BFS shortest path length from from_pos to any cell adjacent to resource_pos.
+        Uses map walkability only - no robot blocking.
+        Returns None if resource is not accessible.
+        """
+        if self._is_walkable is None:
+            return None  # Map not yet available, cannot verify accessibility
+        sx, sy = from_pos
+        rx, ry = resource_pos
+        if not (0 <= sx < self._width and 0 <= sy < self._height):
+            return None
+        if not self._is_walkable(sx, sy):
+            return None
+        goals: Set[Tuple[int, int]] = set()
+        for dx, dy in _BFS_NEIGHBORS:
+            ax, ay = rx + dx, ry + dy
+            if 0 <= ax < self._width and 0 <= ay < self._height and self._is_walkable(ax, ay):
+                goals.add((ax, ay))
+        if not goals:
+            return None
+        if (sx, sy) in goals:
+            return 0
+        queue: deque[Tuple[int, int, int]] = deque([(sx, sy, 0)])
+        visited: Set[Tuple[int, int]] = {(sx, sy)}
+        while queue:
+            x, y, d = queue.popleft()
+            for dx, dy in _BFS_NEIGHBORS:
+                nx, ny = x + dx, y + dy
+                if not (0 <= nx < self._width and 0 <= ny < self._height):
+                    continue
+                if (nx, ny) in visited:
+                    continue
+                if not self._is_walkable(nx, ny):
+                    continue
+                visited.add((nx, ny))
+                new_d = d + 1
+                if (nx, ny) in goals:
+                    return new_d
+                queue.append((nx, ny, new_d))
+        return None
+
+    def _find_closest_available(
+        self,
+        positions: List[Tuple[int, int]],
+        held: Set[Tuple[int, int]],
+        from_pos: Optional[Tuple[int, int]],
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Among available (not held) positions, return closest by BFS shortest path.
+        Only includes resources accessible from from_pos. If from_pos is None, returns first available.
+        """
+        available = [p for p in positions if p not in held]
+        if not available:
+            return None
+        if from_pos is None:
+            return available[0]
+        accessible: List[Tuple[Tuple[int, int], int]] = []
+        for p in available:
+            dist = self._bfs_distance_to_resource(from_pos, p)
+            if dist is not None:
+                accessible.append((p, dist))
+        if not accessible:
+            return None
+        return min(accessible, key=lambda x: x[1])[0]
+
+    # ---------- Counter ----------
+
+    def apply_counter(
+        self,
+        applier_location: Optional[Tuple[int, int]] = None,
+        time_limit: Optional[int] = None,
+        specific_pos: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[bool, Optional[Tuple[int, int]], CounterStatus]:
+        """
+        Request exclusive use of a counter. Resource is held (no owner tracked).
+        - applier_location: (x, y); if given, returns closest available counter
+        - time_limit: turns until auto-release (None = no limit)
+        - specific_pos: if given, request that counter only (ignores applier_location)
+        Returns (success, pos, status). If no resource available: (False, None, EMPTY).
+        """
+        if specific_pos is not None:
+            if specific_pos not in self._counters or specific_pos in self._counter_held:
+                candidates = []
+            elif applier_location is not None and self._bfs_distance_to_resource(applier_location, specific_pos) is None:
+                candidates = []  # not accessible from applier
+            else:
+                candidates = [specific_pos]
+        else:
+            pos = self._find_closest_available(
+                self._counters, self._counter_held, applier_location)
+            candidates = [pos] if pos is not None else []
+        if not candidates:
+            return (False, None, CounterStatus.EMPTY)
+        pos = candidates[0]
+        if pos in self._counter_held:
+            return (False, None, self._counter_status.get(pos, CounterStatus.EMPTY))
+        self._counter_held.add(pos)
+        self._counter_hold_meta[pos] = {
+            "applied_turn": self._current_turn, "time_limit": time_limit}
+        return (True, pos, self._counter_status.get(pos, CounterStatus.EMPTY))
+
+    def release_counter(self, pos: Tuple[int, int]) -> bool:
+        """Release the counter. Returns True if it was held."""
+        if pos in self._counter_held:
+            self._counter_held.discard(pos)
+            self._counter_hold_meta.pop(pos, None)
+            return True
+        return False
+
+    def get_counter_status(self, pos: Tuple[int, int]) -> CounterStatus:
+        return self._counter_status.get(pos, CounterStatus.EMPTY)
+
+    def is_counter_held(self, pos: Tuple[int, int]) -> bool:
+        return pos in self._counter_held
+
+    def is_counter_available(self, pos: Tuple[int, int]) -> bool:
+        return pos not in self._counter_held
+
+    # ---------- Cooker ----------
+
+    def apply_cooker(
+        self,
+        applier_location: Optional[Tuple[int, int]] = None,
+        time_limit: Optional[int] = None,
+        specific_pos: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[bool, Optional[Tuple[int, int]], CookerStatus]:
+        """
+        Request exclusive use of a cooker. Resource is held (no owner tracked).
+        - applier_location: (x, y); if given, returns closest available cooker
+        - time_limit: turns until auto-release (None = no limit)
+        - specific_pos: if given, request that cooker only (ignores applier_location)
+        Returns (success, pos, status). If no resource available: (False, None, NO_PAN).
+        Auto-release also happens when burnt or pan missing (checked in update()).
+        """
+        if specific_pos is not None:
+            if specific_pos not in self._cookers or specific_pos in self._cooker_held:
+                candidates = []
+            elif applier_location is not None and self._bfs_distance_to_resource(applier_location, specific_pos) is None:
+                candidates = []  # not accessible from applier
+            else:
+                candidates = [specific_pos]
+        else:
+            pos = self._find_closest_available(
+                self._cookers, self._cooker_held, applier_location)
+            candidates = [pos] if pos is not None else []
+        if not candidates:
+            return (False, None, CookerStatus.NO_PAN)
+        pos = candidates[0]
+        if pos in self._cooker_held:
+            return (False, None, self._cooker_status.get(pos, CookerStatus.NO_PAN))
+        self._cooker_held.add(pos)
+        self._cooker_hold_meta[pos] = {
+            "applied_turn": self._current_turn, "time_limit": time_limit}
+        return (True, pos, self._cooker_status.get(pos, CookerStatus.NO_PAN))
+
+    def release_cooker(self, pos: Tuple[int, int]) -> bool:
+        """Release the cooker. Returns True if it was held."""
+        if pos in self._cooker_held:
+            self._cooker_held.discard(pos)
+            self._cooker_hold_meta.pop(pos, None)
+            return True
+        return False
+
+    def get_cooker_status(self, pos: Tuple[int, int]) -> CookerStatus:
+        return self._cooker_status.get(pos, CookerStatus.NO_PAN)
+
+    def is_cooker_held(self, pos: Tuple[int, int]) -> bool:
+        return pos in self._cooker_held
+
+    def is_cooker_available(self, pos: Tuple[int, int]) -> bool:
+        return pos not in self._cooker_held
+
+    # ---------- Getters ----------
+
+    def get_all_cookers(self) -> List[Tuple[int, int]]:
+        return list(self._cookers)
+
+    def get_all_counters(self) -> List[Tuple[int, int]]:
+        return list(self._counters)
+
+    def find_nearest_tile(
+        self, controller: RobotController, bot_x: int, bot_y: int, tile_name: str
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Find the nearest tile of the given name reachable from (bot_x, bot_y) by BFS.
+        Uses map walkability; returns the tile position when a walkable cell
+        adjacent to that tile is first reached.
+        """
+        m = controller.get_map(controller.get_team())
+        if self._is_walkable is None:
+            return None
+        width, height = m.width, m.height
+        targets = [
+            (x, y) for x in range(width) for y in range(height)
+            if m.tiles[x][y].tile_name == tile_name
+        ]
+        if not targets:
+            return None
+        targets_set = set(targets)
+
+        if not (0 <= bot_x < self._width and 0 <= bot_y < self._height):
+            return None
+        if not self._is_walkable(bot_x, bot_y):
+            return None
+
+        for dx, dy in _BFS_NEIGHBORS:
+            ax, ay = bot_x + dx, bot_y + dy
+            if (ax, ay) in targets_set:
+                return (ax, ay)
+        if (bot_x, bot_y) in targets_set:
+            return (bot_x, bot_y)
+
+        queue: deque[Tuple[int, int]] = deque([(bot_x, bot_y)])
+        visited: Set[Tuple[int, int]] = {(bot_x, bot_y)}
+        while queue:
+            x, y = queue.popleft()
+            for dx, dy in _BFS_NEIGHBORS:
+                nx, ny = x + dx, y + dy
+                if not (0 <= nx < self._width and 0 <= ny < self._height) or (nx, ny) in visited:
+                    continue
+                if not self._is_walkable(nx, ny):
+                    continue
+                visited.add((nx, ny))
+                for tx, ty in targets:
+                    if max(abs(nx - tx), abs(ny - ty)) <= 1:
+                        return (tx, ty)
+                queue.append((nx, ny))
+        return None
+
 # =============================================================================
 # Action Types
 # =============================================================================
+
 
 class ActionType(Enum):
     """Types of single actions a bot can perform."""
@@ -180,6 +606,7 @@ class ActionType(Enum):
     CHOP = auto()                  # Chop food on counter
     TAKE_FROM_PAN = auto()         # Take food from pan
     ADD_TO_PLATE = auto()          # Add food to plate
+    TRASH = auto()                 # Trash food
     SUBMIT = auto()                # Submit order
 
 
@@ -194,17 +621,15 @@ class Action:
 
     Attributes:
         action_type: The type of action to perform
-        target_coord: Target coordinate (x, y) for the action
         food_type: The food type this action relates to (if applicable)
         item_type: Item type (for buying plates/pans)
     """
     action_type: ActionType
-    target_coord: Optional[Tuple[int, int]] = None
     food_type: Optional[FoodType] = None
     item_type: Optional[ShopCosts] = None
 
     def __repr__(self) -> str:
-        return f"Action({self.action_type.name}, target={self.target_coord})"
+        return f"Action({self.action_type.name})"
 
 
 # =============================================================================
@@ -221,10 +646,17 @@ class SessionType(Enum):
 
     # Food processing sessions
     BUY_AND_PLATE_SIMPLE = auto()        # Buy food -> add to plate (no processing)
-    BUY_CHOP_AND_PLATE = auto()          # Buy -> place -> chop -> pickup -> add to plate
-    BUY_CHOP_AND_COOK = auto()           # Buy -> place -> chop -> pickup -> place in cooker
+    # Buy -> place -> chop
+    BUY_CHOP = auto()
+    # Buy -> place -> chop -> pickup -> place in cooker
+    BUY_CHOP_AND_COOK = auto()
     BUY_AND_COOK = auto()                # Buy -> place in cooker (no chop needed)
     TAKE_AND_PLATE_COOKED = auto()       # Take from pan -> add to plate (when ready)
+
+    # Trash sessions
+    CLEAR_PAN = auto()                  # Pick food from pan -> trash
+    CLEAR_AND_PLACE_PLATE = auto()      # Clear plate -> place in sink
+    TAKE_AND_TRASH = auto()             # Take from counter -> trash
 
     # Final session
     PICKUP_AND_SUBMIT = auto()           # Pickup plate -> submit
@@ -245,8 +677,6 @@ class Session:
         session_type: The type of session
         actions: Queue of actions that make up this session
         food_type: The food type being processed (if applicable)
-        start_coord: Starting coordinate for estimating time
-        end_coord: Ending coordinate for estimating time
         completed: Whether this session is finished
         current_action_index: Index of current action being executed
         available_after_turn: Turn after which this session becomes available (for cooking)
@@ -255,8 +685,6 @@ class Session:
     session_type: SessionType
     actions: List[Action] = field(default_factory=list)
     food_type: Optional[FoodType] = None
-    start_coord: Optional[Tuple[int, int]] = None
-    end_coord: Optional[Tuple[int, int]] = None
     completed: bool = False
     current_action_index: int = 0
     available_after_turn: Optional[int] = None  # For TAKE_AND_PLATE_COOKED
@@ -289,151 +717,145 @@ class Session:
         self.current_action_index = 0
         self.completed = False
 
-    def estimate_time(self) -> int:
-        """Estimate total time for this session."""
-        time = len(self.actions)  # Base: 1 turn per action
-        # Add travel time estimate
-        if self.start_coord and self.end_coord:
-            time += max(abs(self.end_coord[0] - self.start_coord[0]),
-                       abs(self.end_coord[1] - self.start_coord[1]))
-        return time
-
     @staticmethod
-    def create_buy_and_place_pan(shop_loc: Tuple[int, int],
-                                  cooker_loc: Tuple[int, int]) -> 'Session':
-        """Create session: Buy pan -> place on cooker."""
+    def create_buy_and_place_pan() -> 'Session':
+        """Create session: Buy pan -> place on cooker. Target coords set dynamically at action time."""
         return Session(
             session_type=SessionType.BUY_AND_PLACE_PAN,
             actions=[
-                Action(ActionType.BUY, target_coord=shop_loc, item_type=ShopCosts.PAN),
-                Action(ActionType.PLACE, target_coord=cooker_loc),
+                Action(ActionType.BUY, item_type=ShopCosts.PAN),
+                Action(ActionType.PLACE),
             ],
-            start_coord=shop_loc,
-            end_coord=cooker_loc,
             priority=0  # Highest priority - setup first
         )
 
     @staticmethod
-    def create_buy_and_place_plate(shop_loc: Tuple[int, int],
-                                    counter_loc: Tuple[int, int]) -> 'Session':
-        """Create session: Buy plate -> place on counter."""
+    def create_clear_pan() -> 'Session':
+        """Create session: Pick food from pan -> trash. Target coords set dynamically at action time."""
+        return Session(
+            session_type=SessionType.CLEAR_PAN,
+            actions=[
+                Action(ActionType.TAKE_FROM_PAN),
+                Action(ActionType.TRASH),
+            ],
+            priority=2  # Second highest priority - clear pan second
+        )
+
+    @staticmethod
+    def create_clear_and_place_plate() -> 'Session':
+        """Create session: Clear plate -> place in sink. Target coords set dynamically at action time."""
+        return Session(
+            session_type=SessionType.CLEAR_AND_PLACE_PLATE,
+            actions=[
+                Action(ActionType.PICKUP),
+                Action(ActionType.PLACE),
+            ],
+            priority=2  # Second highest priority - clear plate second
+        )
+
+    @staticmethod
+    def create_buy_and_place_plate() -> 'Session':
+        """Create session: Buy plate -> place on counter. Target coords set dynamically at action time."""
         return Session(
             session_type=SessionType.BUY_AND_PLACE_PLATE,
             actions=[
-                Action(ActionType.BUY, target_coord=shop_loc, item_type=ShopCosts.PLATE),
-                Action(ActionType.PLACE, target_coord=counter_loc),
+                Action(ActionType.BUY, item_type=ShopCosts.PLATE),
+                Action(ActionType.PLACE),
             ],
-            start_coord=shop_loc,
-            end_coord=counter_loc,
             priority=5  # After cooking starts, before adding food
         )
 
     @staticmethod
-    def create_buy_and_plate_simple(shop_loc: Tuple[int, int],
-                                     plate_loc: Tuple[int, int],
-                                     food_type: FoodType) -> 'Session':
-        """Create session: Buy food -> add to plate (no processing needed)."""
+    def create_take_and_trash() -> 'Session':
+        """Create session: Take from counter -> trash. Target coords set dynamically at action time."""
+        return Session(
+            session_type=SessionType.TAKE_AND_TRASH,
+            actions=[
+                Action(ActionType.PICKUP),
+                Action(ActionType.TRASH),
+            ],
+            priority=6  # After cooking starts, before adding food
+        )
+
+    @staticmethod
+    def create_buy_and_plate_simple(food_type: FoodType) -> 'Session':
+        """Create session: Buy food -> add to plate (no processing needed). Target coords set dynamically at action time."""
         return Session(
             session_type=SessionType.BUY_AND_PLATE_SIMPLE,
             actions=[
-                Action(ActionType.BUY, target_coord=shop_loc, food_type=food_type),
-                Action(ActionType.ADD_TO_PLATE, target_coord=plate_loc),
+                Action(ActionType.BUY, food_type=food_type),
+                Action(ActionType.ADD_TO_PLATE),
             ],
             food_type=food_type,
-            start_coord=shop_loc,
-            end_coord=plate_loc,
             priority=10  # Normal priority
         )
 
     @staticmethod
-    def create_buy_chop_and_plate(shop_loc: Tuple[int, int],
-                                   counter_loc: Tuple[int, int],
-                                   plate_loc: Tuple[int, int],
-                                   food_type: FoodType) -> 'Session':
-        """Create session: Buy -> place -> chop -> pickup -> add to plate."""
+    def create_buy_chop(food_type: FoodType) -> 'Session':
+        """Create session: Buy -> place -> chop. Target coords set dynamically at action time."""
         return Session(
-            session_type=SessionType.BUY_CHOP_AND_PLATE,
+            session_type=SessionType.BUY_CHOP,
             actions=[
-                Action(ActionType.BUY, target_coord=shop_loc, food_type=food_type),
-                Action(ActionType.PLACE, target_coord=counter_loc),
-                Action(ActionType.CHOP, target_coord=counter_loc),
-                Action(ActionType.PICKUP, target_coord=counter_loc),
-                Action(ActionType.ADD_TO_PLATE, target_coord=plate_loc),
+                Action(ActionType.BUY, food_type=food_type),
+                Action(ActionType.PLACE),
+                Action(ActionType.CHOP),
             ],
             food_type=food_type,
-            start_coord=shop_loc,
-            end_coord=plate_loc,
-            priority=10
+            priority=4
         )
 
     @staticmethod
-    def create_buy_chop_and_cook(shop_loc: Tuple[int, int],
-                                  counter_loc: Tuple[int, int],
-                                  cooker_loc: Tuple[int, int],
-                                  food_type: FoodType) -> 'Session':
-        """Create session: Buy -> place -> chop -> pickup -> place in cooker."""
+    def create_buy_chop_and_cook(food_type: FoodType) -> 'Session':
+        """Create session: Buy -> place -> chop -> pickup -> place in cooker. Target coords set dynamically at action time."""
         return Session(
             session_type=SessionType.BUY_CHOP_AND_COOK,
             actions=[
-                Action(ActionType.BUY, target_coord=shop_loc, food_type=food_type),
-                Action(ActionType.PLACE, target_coord=counter_loc),
-                Action(ActionType.CHOP, target_coord=counter_loc),
-                Action(ActionType.PICKUP, target_coord=counter_loc),
-                Action(ActionType.PLACE, target_coord=cooker_loc),
+                Action(ActionType.BUY, food_type=food_type),
+                Action(ActionType.PLACE),
+                Action(ActionType.CHOP),
+                Action(ActionType.PICKUP),
+                Action(ActionType.PLACE),
             ],
             food_type=food_type,
-            start_coord=shop_loc,
-            end_coord=cooker_loc,
-            priority=1  # High priority - start cooking early
+            priority=3  # High priority - start cooking early
         )
 
     @staticmethod
-    def create_buy_and_cook(shop_loc: Tuple[int, int],
-                             cooker_loc: Tuple[int, int],
-                             food_type: FoodType) -> 'Session':
-        """Create session: Buy -> place in cooker (no chop)."""
+    def create_buy_and_cook(food_type: FoodType) -> 'Session':
+        """Create session: Buy -> place in cooker (no chop). Target coords set dynamically at action time."""
         return Session(
             session_type=SessionType.BUY_AND_COOK,
             actions=[
-                Action(ActionType.BUY, target_coord=shop_loc, food_type=food_type),
-                Action(ActionType.PLACE, target_coord=cooker_loc),
+                Action(ActionType.BUY, food_type=food_type),
+                Action(ActionType.PLACE),
             ],
             food_type=food_type,
-            start_coord=shop_loc,
-            end_coord=cooker_loc,
-            priority=1  # High priority - start cooking early
+            priority=5  # High priority - start cooking early
         )
 
     @staticmethod
-    def create_take_and_plate_cooked(cooker_loc: Tuple[int, int],
-                                      plate_loc: Tuple[int, int],
-                                      food_type: FoodType) -> 'Session':
-        """Create session: Take from pan -> add to plate (when cooked)."""
+    def create_take_and_plate_cooked(food_type: FoodType) -> 'Session':
+        """Create session: Take from pan -> add to plate (when cooked). Target coords set dynamically at action time."""
         return Session(
             session_type=SessionType.TAKE_AND_PLATE_COOKED,
             actions=[
-                Action(ActionType.TAKE_FROM_PAN, target_coord=cooker_loc),
-                Action(ActionType.ADD_TO_PLATE, target_coord=plate_loc),
+                Action(ActionType.TAKE_FROM_PAN),
+                Action(ActionType.ADD_TO_PLATE),
             ],
             food_type=food_type,
-            start_coord=cooker_loc,
-            end_coord=plate_loc,
             available_after_turn=None,  # Will be set when cooking starts
             priority=20  # Lower priority - do after other prep
         )
 
     @staticmethod
-    def create_pickup_and_submit(plate_loc: Tuple[int, int],
-                                  submit_loc: Tuple[int, int]) -> 'Session':
-        """Create session: Pickup plate -> submit order."""
+    def create_pickup_and_submit() -> 'Session':
+        """Create session: Pickup plate -> submit order. Target coords set dynamically at action time."""
         return Session(
             session_type=SessionType.PICKUP_AND_SUBMIT,
             actions=[
-                Action(ActionType.PICKUP, target_coord=plate_loc),
-                Action(ActionType.SUBMIT, target_coord=submit_loc),
+                Action(ActionType.PICKUP),
+                Action(ActionType.SUBMIT),
             ],
-            start_coord=plate_loc,
-            end_coord=submit_loc,
             priority=100  # Last
         )
 
@@ -473,12 +895,10 @@ class FoodMaterial:
     def buy_cost(self) -> int:
         return self.food_type.buy_cost
 
-    def build_sessions(self, shop_loc: Tuple[int, int],
-                       counter_loc: Tuple[int, int],
-                       cooker_loc: Tuple[int, int],
-                       plate_loc: Tuple[int, int]) -> None:
+    def build_sessions(self) -> None:
         """
         Build the session list based on food type requirements.
+        Target locations are set dynamically when executing each action.
 
         Session patterns:
         - Simple (no chop, no cook): BUY_AND_PLATE_SIMPLE
@@ -491,27 +911,26 @@ class FoodMaterial:
 
         if self.can_chop and self.can_cook:
             # Chop then cook (e.g., MEAT)
-            self.sessions.append(Session.create_buy_chop_and_cook(
-                shop_loc, counter_loc, cooker_loc, self.food_type))
-            self.sessions.append(Session.create_take_and_plate_cooked(
-                cooker_loc, plate_loc, self.food_type))
+            self.sessions.append(
+                Session.create_buy_chop_and_cook(self.food_type))
+            self.sessions.append(
+                Session.create_take_and_plate_cooked(self.food_type))
 
         elif self.can_cook:
             # Cook only (e.g., EGG)
-            self.sessions.append(Session.create_buy_and_cook(
-                shop_loc, cooker_loc, self.food_type))
-            self.sessions.append(Session.create_take_and_plate_cooked(
-                cooker_loc, plate_loc, self.food_type))
+            self.sessions.append(Session.create_buy_and_cook(self.food_type))
+            self.sessions.append(
+                Session.create_take_and_plate_cooked(self.food_type))
 
         elif self.can_chop:
             # Chop only (e.g., ONIONS)
-            self.sessions.append(Session.create_buy_chop_and_plate(
-                shop_loc, counter_loc, plate_loc, self.food_type))
+            self.sessions.append(
+                Session.create_buy_chop(self.food_type))
 
         else:
             # Simple - no processing (e.g., NOODLES, SAUCE)
-            self.sessions.append(Session.create_buy_and_plate_simple(
-                shop_loc, plate_loc, self.food_type))
+            self.sessions.append(
+                Session.create_buy_and_plate_simple(self.food_type))
 
     def get_current_session(self) -> Optional[Session]:
         """Get the current session to execute."""
@@ -528,8 +947,11 @@ class FoodMaterial:
         return False
 
     def total_estimated_time(self) -> int:
-        """Calculate total estimated time for all remaining sessions."""
-        return sum(s.estimate_time() for s in self.sessions[self.current_session_index:])
+        """Count remaining actions across remaining sessions (rough workload measure for priority)."""
+        return sum(
+            len(s.actions) - s.current_action_index
+            for s in self.sessions[self.current_session_index:]
+        )
 
 
 # =============================================================================
@@ -549,7 +971,6 @@ class DIYOrder:
         reward: Money earned on completion
         penalty: Money lost on expiration
         priority: Calculated priority for scheduling (lower = higher priority)
-        assigned_bot_id: Bot assigned to complete this order
         is_completed: Whether the order has been submitted
     """
     order_id: int
@@ -559,24 +980,24 @@ class DIYOrder:
     reward: int = 0
     penalty: int = 0
     priority: float = 0.0
-    assigned_bot_id: Optional[int] = None
+    start: bool = False
     is_completed: bool = False
+    # Counter reserved for this order
+    reserved_counter_pos: Optional[Tuple[int, int]] = None
+    reserved_pan_pos: Optional[Tuple[int, int]] = None
+    # Only this bot works on this order (one robot per order)
+    assigned_bot_id: Optional[int] = None
+
+    order_sessions: List[Session] = field(default_factory=list)
 
     @classmethod
-    def from_api_order(cls, order_dict: Dict[str, Any],
-                       shop_loc: Tuple[int, int],
-                       counter_loc: Tuple[int, int],
-                       cooker_loc: Tuple[int, int],
-                       plate_loc: Tuple[int, int]) -> 'DIYOrder':
+    def from_api_order(cls, order_dict: Dict[str, Any]) -> 'DIYOrder':
         """
         Create a DIYOrder from the API order dictionary.
+        Locations are resolved dynamically when executing each action.
 
         Args:
             order_dict: Order dictionary from controller.get_orders()
-            shop_loc: Location of shop
-            counter_loc: Location of counter
-            cooker_loc: Location of cooker
-            plate_loc: Location for plate assembly
         """
         # Map food names to FoodType enum
         food_name_to_type = {
@@ -592,7 +1013,7 @@ class DIYOrder:
             food_type = food_name_to_type.get(food_name)
             if food_type:
                 food_material = FoodMaterial(food_type=food_type)
-                food_material.build_sessions(shop_loc, counter_loc, cooker_loc, plate_loc)
+                food_material.build_sessions()
                 required_foods.append(food_material)
 
         diy_order = cls(
@@ -603,7 +1024,6 @@ class DIYOrder:
             reward=order_dict.get("reward", 0),
             penalty=order_dict.get("penalty", 0),
         )
-        diy_order.calculate_priority()
         return diy_order
 
     def calculate_priority(self, current_turn: int = 0) -> None:
@@ -627,7 +1047,8 @@ class DIYOrder:
 
         # Priority formula: urgency weighted heavily, value as tiebreaker
         # Negative buffer = very urgent (low/negative priority value)
-        self.priority = buffer_time - (value_ratio * 0.1) - (self.penalty * 0.05)
+        self.priority = buffer_time - \
+            (value_ratio * 0.1) - (self.penalty * 0.05)
 
     def total_estimated_time(self) -> int:
         """Calculate total estimated time to complete all foods in order."""
@@ -653,7 +1074,7 @@ class DIYOrder:
             sessions.extend(food.sessions)
         return sessions
 
-    def get_next_session(self, current_turn: int) -> Optional[Session]:
+    def get_next_session(self, current_turn: int) -> Optional[Tuple[Session, Optional[FoodMaterial]]]:
         """
         Get the next available session based on priority and availability.
         Returns the highest priority session that is available now.
@@ -662,20 +1083,28 @@ class DIYOrder:
         for food in self.required_foods:
             for session in food.sessions:
                 if not session.completed and session.is_available(current_turn):
-                    available_sessions.append(session)
+                    available_sessions.append((session, food))
+
+        for session in self.order_sessions:
+            if not session.completed and session.is_available(current_turn):
+                available_sessions.append((session, None))
 
         if not available_sessions:
             return None
 
         # Sort by priority (lower = higher priority)
-        available_sessions.sort(key=lambda s: s.priority)
+        available_sessions.sort(key=lambda s: s[0].priority)
         return available_sessions[0]
 
-    def get_food_for_session(self, session: Session) -> Optional[FoodMaterial]:
-        """Get the FoodMaterial that owns this session."""
-        for food in self.required_foods:
-            if session in food.sessions:
-                return food
+    def add_order_session(self, session: Session) -> None:
+        """Add a session to the order."""
+        self.order_sessions.append(session)
+        self.order_sessions.sort(key=lambda s: s.priority)
+
+    def pop_order_session(self) -> Optional[Session]:
+        """Pop the next session from the order."""
+        if self.order_sessions:
+            return self.order_sessions.pop(0)
         return None
 
     def get_current_food(self) -> Optional[FoodMaterial]:
@@ -703,21 +1132,7 @@ class Scheduler:
         self.completed_orders: List[DIYOrder] = []
         self.known_order_ids: set = set()
 
-        # Tile locations (to be set by BotPlayer)
-        self.shop_loc: Optional[Tuple[int, int]] = None
-        self.counter_loc: Optional[Tuple[int, int]] = None
-        self.cooker_loc: Optional[Tuple[int, int]] = None
-        self.submit_loc: Optional[Tuple[int, int]] = None
-        self.plate_loc: Optional[Tuple[int, int]] = None  # Where plate is assembled
-
-    def set_locations(self, shop: Tuple[int, int], counter: Tuple[int, int],
-                      cooker: Tuple[int, int], submit: Tuple[int, int]) -> None:
-        """Set the tile locations for action planning."""
-        self.shop_loc = shop
-        self.counter_loc = counter
-        self.cooker_loc = cooker
-        self.submit_loc = submit
-        self.plate_loc = counter  # Default: assemble plate on counter
+        self.resource_manager: Optional[ResourceManager] = None
 
     def receive_orders(self, controller: RobotController, current_turn: int) -> None:
         """
@@ -727,9 +1142,6 @@ class Scheduler:
             controller: The RobotController to get orders from
             current_turn: The current game turn
         """
-        if not all([self.shop_loc, self.counter_loc, self.cooker_loc, self.submit_loc]):
-            return  # Locations not set yet
-
         api_orders = controller.get_orders(controller.get_team())
 
         for order_dict in api_orders:
@@ -742,14 +1154,8 @@ class Scheduler:
             if not is_active:
                 continue
 
-            # Create new DIYOrder and add to list
-            diy_order = DIYOrder.from_api_order(
-                order_dict,
-                self.shop_loc,
-                self.counter_loc,
-                self.cooker_loc,
-                self.plate_loc
-            )
+            # Create new DIYOrder and add to list (locations resolved at action time)
+            diy_order = DIYOrder.from_api_order(order_dict)
             diy_order.calculate_priority(current_turn)
             self.orders.append(diy_order)
             self.known_order_ids.add(order_id)
@@ -771,21 +1177,24 @@ class Scheduler:
         self.orders.sort(key=lambda o: o.priority)
 
     def _remove_expired_orders(self, current_turn: int) -> None:
-        """Remove orders that have expired."""
+        """Remove orders that have expired. Release reserved counter for each."""
         active_orders = []
         for order in self.orders:
             if order.is_expired(current_turn):
-                # Move to completed (as failed)
+                if order.reserved_counter_pos and self.resource_manager:
+                    self.resource_manager.release_counter(
+                        order.reserved_counter_pos)
                 order.is_completed = True
+                order.assigned_bot_id = None
                 self.completed_orders.append(order)
             else:
                 active_orders.append(order)
         self.orders = active_orders
 
-    def get_next_order(self) -> Optional[DIYOrder]:
-        """Get the highest priority unassigned order."""
+    def get_highest_order(self) -> Optional[DIYOrder]:
+        """Get the highest priority order."""
         for order in self.orders:
-            if order.assigned_bot_id is None and not order.is_completed:
+            if not order.is_completed:
                 return order
         return None
 
@@ -796,35 +1205,88 @@ class Scheduler:
                 return order
         return None
 
-    def assign_order(self, order_id: int, bot_id: int) -> bool:
-        """Assign an order to a specific bot."""
+    def start_order(self, order_id: int, start_location: Tuple[int, int] = None,
+                    bot_id: Optional[int] = None) -> bool:
+        """Start an order. If bot_id is given, assigns this order to that bot only."""
         order = self.get_order_by_id(order_id)
-        if order and order.assigned_bot_id is None:
-            order.assigned_bot_id = bot_id
+        if order and not order.start:
+            # Reserve counter
+            reserve_flag = True
+            if order.reserved_counter_pos is None and self.resource_manager:
+                ok, pos, _ = self.resource_manager.apply_counter(
+                    applier_location=start_location, time_limit=order.expires_turn - order.created_turn)
+                if ok and pos is not None:
+                    order.reserved_counter_pos = pos
+                else:
+                    reserve_flag = False
+            else:
+                if not self.resource_manager:
+                    reserve_flag = False
+            # Reserve pan when the required food is using pan
+            for food in order.required_foods:
+                if food.can_cook:
+                    if order.reserved_pan_pos is None and self.resource_manager:
+                        ok, pos, _ = self.resource_manager.apply_cooker(
+                            applier_location=start_location, time_limit=order.expires_turn - order.created_turn)
+                        if ok and pos is not None:
+                            order.reserved_pan_pos = pos
+                        else:
+                            reserve_flag = False
+                    elif not self.resource_manager:
+                        reserve_flag = False
+                    break
+
+            # Release every reserved resource if not reserve_flag
+            if not reserve_flag:
+                if order.reserved_counter_pos is not None and self.resource_manager:
+                    self.resource_manager.release_counter(
+                        order.reserved_counter_pos)
+                    order.reserved_counter_pos = None
+                if order.reserved_pan_pos is not None and self.resource_manager:
+                    self.resource_manager.release_cooker(
+                        order.reserved_pan_pos)
+                    order.reserved_pan_pos = None
+                return False
+
+            order.start = True
+            if bot_id is not None:
+                order.assigned_bot_id = bot_id
             return True
         return False
 
     def complete_order(self, order_id: int) -> bool:
-        """Mark an order as completed."""
+        """Mark an order as completed and release its reserved counter."""
         order = self.get_order_by_id(order_id)
         if order:
+            if order.reserved_counter_pos and self.resource_manager:
+                self.resource_manager.release_counter(
+                    order.reserved_counter_pos)
             order.is_completed = True
+            order.assigned_bot_id = None
             self.orders.remove(order)
             self.completed_orders.append(order)
             return True
         return False
 
-    def get_orders_for_bot(self, bot_id: int) -> List[DIYOrder]:
-        """Get all orders assigned to a specific bot."""
-        return [o for o in self.orders if o.assigned_bot_id == bot_id]
-
     def get_active_orders(self) -> List[DIYOrder]:
-        """Get all active (non-completed, non-expired) orders."""
-        return [o for o in self.orders if not o.is_completed]
+        """Get all active (started, non-completed, non-expired) orders."""
+        return [o for o in self.orders if o.start and not o.is_completed]
+
+    def get_active_orders_for_bot(self, bot_id: int) -> List[DIYOrder]:
+        """Get active orders this bot may work on: unassigned or assigned to this bot."""
+        return [o for o in self.orders if o.start and not o.is_completed
+                and (o.assigned_bot_id is None or o.assigned_bot_id == bot_id)]
+
+    def get_highest_pending_order(self) -> Optional[DIYOrder]:
+        """Get the highest priority order that has not been started (for claiming)."""
+        for order in self.orders:
+            if not order.start and not order.is_completed:
+                return order
+        return None
 
     def get_pending_orders(self) -> List[DIYOrder]:
-        """Get all unassigned orders."""
-        return [o for o in self.orders if o.assigned_bot_id is None and not o.is_completed]
+        """Get all orders that have not been started."""
+        return [o for o in self.orders if not o.start and not o.is_completed]
 
     def __len__(self) -> int:
         return len(self.orders)
@@ -836,6 +1298,7 @@ class Scheduler:
 # BotWorker Class - Tracks individual bot's current work state
 # =============================================================================
 
+
 @dataclass
 class BotWorker:
     """
@@ -844,18 +1307,11 @@ class BotWorker:
     bot_id: int
     current_order: Optional[DIYOrder] = None
     current_session: Optional[Session] = None
-    pan_placed: bool = False
-    plate_placed: bool = False
+    in_ensure_pan_or_cooker: bool = False
+    in_submit_order: bool = False
 
-    def is_idle(self) -> bool:
-        return self.current_order is None
-
-    def assign_order(self, order: DIYOrder) -> None:
-        """Assign a new order to this bot."""
-        self.current_order = order
-        self.current_session = None
-        self.plate_placed = False
-        self.pan_placed = False
+    def is_busy(self) -> bool:
+        return self.in_ensure_pan_or_cooker or self.in_submit_order or self.current_session is not None
 
     def finish_order(self) -> None:
         """Mark order as complete and reset to idle."""
@@ -863,23 +1319,17 @@ class BotWorker:
             self.current_order.is_completed = True
         self.current_order = None
         self.current_session = None
-        self.plate_placed = False
+        self.in_ensure_pan_or_cooker = False
+        self.in_submit_order = False
 
 
 class BotPlayer:
     def __init__(self, map_copy):
         self.map = map_copy
 
-        # Tile locations
-        self.counter_loc: Optional[Tuple[int, int]] = None
-        self.cooker_loc: Optional[Tuple[int, int]] = None
-        self.shop_loc: Optional[Tuple[int, int]] = None
-        self.submit_loc: Optional[Tuple[int, int]] = None
-        self.trash_loc: Optional[Tuple[int, int]] = None
-
-        # Scheduler
+        # Scheduler (no pre-asserted tile locations; resolve dynamically at action time)
         self.scheduler = Scheduler()
-        self.scheduler_initialized = False
+        self.resource_manager: Optional[ResourceManager] = None
 
         # Workers for each bot
         self.workers: Dict[int, BotWorker] = {}
@@ -891,47 +1341,34 @@ class BotPlayer:
         """Initialize or update the route calculator with current map."""
         m = controller.get_map(controller.get_team())
 
-        def is_walkable(x: int, y: int) -> bool:
-            return m.is_tile_walkable(x, y)
-
         if self.route_calc is None:
-            self.route_calc = RouteCalculator(m.width, m.height, is_walkable)
+            self.route_calc = RouteCalculator(
+                m.width, m.height, m.is_tile_walkable)
         else:
-            self.route_calc.update_map(m.width, m.height, is_walkable)
+            self.route_calc.update_map(m.width, m.height, m.is_tile_walkable)
 
-    def _find_adjacent_target(self, target_x: int, target_y: int,
-                               bot_x: int, bot_y: int) -> Tuple[int, int]:
-        """Find the best adjacent cell to a target tile."""
-        # If already adjacent, return current position
-        if max(abs(bot_x - target_x), abs(bot_y - target_y)) <= 1:
-            return (bot_x, bot_y)
-
-        # Find all adjacent walkable cells and pick the closest to bot
-        best_pos = (target_x, target_y)  # Fallback
-        best_dist = 9999
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                ax, ay = target_x + dx, target_y + dy
-                if self.route_calc and self.route_calc._in_bounds(ax, ay):
-                    if self.route_calc._is_walkable(ax, ay):
-                        dist = max(abs(bot_x - ax), abs(bot_y - ay))
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_pos = (ax, ay)
-        return best_pos
+    def _init_resource_manager(self, controller: RobotController) -> None:
+        """Initialize the resource manager."""
+        if not self.resource_manager:
+            self.resource_manager = ResourceManager()
+            self.resource_manager.discover_resources(controller)
+            self.resource_manager.update(controller)
+        else:
+            self.resource_manager.update(controller)
+        self.scheduler.resource_manager = self.resource_manager
 
     def move_towards(self, controller: RobotController, bot_id: int,
                      target_x: int, target_y: int) -> bool:
         """
-        Move bot towards target using RouteCalculator.
-        Returns True if adjacent to target.
+        Move bot towards target using RouteCalculator. Pathfinding only requires
+        reaching a cell that touches the target (on or adjacent), so the target
+        tile does not need to be walkable. Returns True when adjacent to target
+        (so bot can interact).
         """
         bot_state = controller.get_bot_state(bot_id)
         bx, by = bot_state['x'], bot_state['y']
 
-        # Check if already adjacent to target
+        # Check if already adjacent to target (can touch / interact)
         if max(abs(bx - target_x), abs(by - target_y)) <= 1:
             # Release any existing reservation since we've arrived
             if self.route_calc:
@@ -939,198 +1376,309 @@ class BotPlayer:
             return True
 
         if self.route_calc is None:
-            return False
+            self._init_route_calculator(controller)
 
-        # Find an adjacent walkable cell as destination
-        dest = self._find_adjacent_target(target_x, target_y, bx, by)
+        # Block cells occupied by other robots so we don't step on them
+        team = controller.get_team()
+        other_robot_cells: Set[Tuple[int, int]] = set()
+        for other_id in controller.get_team_bot_ids(team):
+            if other_id == bot_id:
+                continue
+            state = controller.get_bot_state(other_id)
+            if state is not None:
+                other_robot_cells.add((state["x"], state["y"]))
 
-        # Check if we already have a reservation
+        # Check if we already have a reservation for this same target
         if self.route_calc.has_reservation(bot_id):
-            step = self.route_calc.get_next_step(bot_id)
-            if step:
-                dx, dy = step
-                controller.move(bot_id, dx, dy)
-            else:
-                # No more steps - release and re-plan
+            if self.route_calc.has_reservation(bot_id, (target_x, target_y)):
                 self.route_calc.release_path(bot_id)
-            return False
+        
+        if not self.route_calc.has_reservation(bot_id, (target_x, target_y)):
+            success, path = self.route_calc.try_reserve_path(
+                bot_id, (bx, by), (target_x, target_y),
+                extra_blocked_cells=other_robot_cells,
+            )
+            if not success:
+                return False
 
-        # Try to reserve a new path
-        success, path = self.route_calc.try_reserve_path(bot_id, (bx, by), dest)
-        if success and path:
-            step = self.route_calc.get_next_step(bot_id)
-            if step:
-                dx, dy = step
-                controller.move(bot_id, dx, dy)
+        step = self.route_calc.get_next_step(bot_id)
+        if step:
+            dx, dy = step
+            if controller.move(bot_id, dx, dy):
+                # After moving, check if we're now adjacent to target (can act this turn)
+                new_bx, new_by = bx + dx, by + dy
+                if max(abs(new_bx - target_x), abs(new_by - target_y)) <= 1:
+                    if self.route_calc:
+                        self.route_calc.release_path(bot_id)
+                    return True
+                return False  # Moved one step but not adjacent yet
+        else:
+            # No more steps - release and re-plan
+            self.route_calc.release_path(bot_id)
         return False
 
-    def find_nearest_tile(self, controller: RobotController, bot_x: int,
-                          bot_y: int, tile_name: str) -> Optional[Tuple[int, int]]:
-        best_dist = 9999
-        best_pos = None
-        m = controller.get_map(controller.get_team())
-        for x in range(m.width):
-            for y in range(m.height):
-                tile = m.tiles[x][y]
-                if tile.tile_name == tile_name:
-                    dist = max(abs(bot_x - x), abs(bot_y - y))
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_pos = (x, y)
-        return best_pos
+    def _resolve_target_for_action(self, controller: RobotController, bot_id: int,
+                                   session: Session, order: DIYOrder) -> Optional[Tuple[int, int]]:
+        """Resolve dynamic target coord for the current action in the session."""
+        action = session.get_current_action()
+        if action is None:
+            return None
+        bot_info = controller.get_bot_state(bot_id)
+        bx, by = bot_info['x'], bot_info['y']
+        idx = session.current_action_index
+        st = session.session_type
+        at = action.action_type
 
-    def initialize_locations(self, controller: RobotController, bx: int, by: int) -> bool:
-        """Initialize all tile locations. Returns True if successful."""
-        if self.counter_loc is None:
-            self.counter_loc = self.find_nearest_tile(controller, bx, by, "COUNTER")
-        if self.cooker_loc is None:
-            self.cooker_loc = self.find_nearest_tile(controller, bx, by, "COOKER")
-        if self.shop_loc is None:
-            self.shop_loc = self.find_nearest_tile(controller, bx, by, "SHOP")
-        if self.submit_loc is None:
-            self.submit_loc = self.find_nearest_tile(controller, bx, by, "SUBMIT")
-        if self.trash_loc is None:
-            self.trash_loc = self.find_nearest_tile(controller, bx, by, "TRASH")
+        tile_name: Optional[str] = None
+        if at == ActionType.BUY:
+            tile_name = 'SHOP'
+        elif at == ActionType.PLACE:
+            if st == SessionType.BUY_AND_PLACE_PAN:
+                tile_name = 'COOKER'
+            elif st == SessionType.BUY_AND_PLACE_PLATE:
+                tile_name = 'COUNTER'
+            elif st == SessionType.CLEAR_AND_PLACE_PLATE:
+                tile_name = 'SINK'
+            elif st == SessionType.BUY_CHOP:
+                tile_name = 'COUNTER'
+            elif st == SessionType.BUY_CHOP_AND_COOK:
+                tile_name = 'COOKER' if idx == 4 else 'COUNTER'
+            elif st == SessionType.BUY_AND_COOK:
+                tile_name = 'COOKER'
+        elif at == ActionType.CHOP or at == ActionType.PICKUP or at == ActionType.ADD_TO_PLATE:
+            tile_name = 'COUNTER'
+        elif at == ActionType.TAKE_FROM_PAN:
+            tile_name = 'COOKER'
+        elif at == ActionType.TRASH:
+            tile_name = 'TRASH'
+        elif at == ActionType.SUBMIT:
+            tile_name = 'SUBMIT'
 
-        if all([self.counter_loc, self.cooker_loc, self.shop_loc, self.submit_loc]):
-            if not self.scheduler_initialized:
-                self.scheduler.set_locations(
-                    shop=self.shop_loc,
-                    counter=self.counter_loc,
-                    cooker=self.cooker_loc,
-                    submit=self.submit_loc
-                )
-                self.scheduler_initialized = True
-            return True
-        return False
+        if tile_name is None:
+            return None
+
+        if tile_name == 'COOKER':
+            return order.reserved_pan_pos
+        elif tile_name == 'COUNTER':
+            return order.reserved_counter_pos
+
+        if self.resource_manager is None:
+            return None
+        return self.resource_manager.find_nearest_tile(controller, bx, by, tile_name)
 
     def execute_action(self, controller: RobotController, bot_id: int,
-                       action: Action) -> bool:
+                       action: Action, target: Tuple[int, int]) -> Tuple[bool, str]:
         """
-        Execute a single action. Returns True if action completed.
+        Execute a single action at the given target location.
+        Returns (True, message) if action completed, (False, message) with reason otherwise.
         """
         bot_info = controller.get_bot_state(bot_id)
-        tx, ty = action.target_coord if action.target_coord else (0, 0)
+        tx, ty = target
 
         if action.action_type == ActionType.BUY:
             if bot_info.get('holding'):
-                return False  # Can't buy if holding something
+                return False, "BUY failed: bot is already holding something"
             if self.move_towards(controller, bot_id, tx, ty):
                 if action.food_type:
                     cost = action.food_type.buy_cost
                     if controller.get_team_money(controller.get_team()) >= cost:
-                        return controller.buy(bot_id, action.food_type, tx, ty)
+                        ok = controller.buy(bot_id, action.food_type, tx, ty)
+                        return (ok, f"BUY {action.food_type.food_name} at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+                    return False, f"BUY failed: not enough money (need {cost})"
                 elif action.item_type:
                     cost = action.item_type.buy_cost
                     if controller.get_team_money(controller.get_team()) >= cost:
-                        return controller.buy(bot_id, action.item_type, tx, ty)
-            return False
+                        ok = controller.buy(bot_id, action.item_type, tx, ty)
+                        return (ok, f"BUY {getattr(action.item_type, 'item_name', type(action.item_type).__name__)} at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+                    return False, f"BUY failed: not enough money (need {cost})"
+            return False, "BUY failed: could not move to target"
 
         elif action.action_type == ActionType.PLACE:
             if not bot_info.get('holding'):
-                return False  # Nothing to place
+                return False, "PLACE failed: bot is not holding anything"
             if self.move_towards(controller, bot_id, tx, ty):
-                return controller.place(bot_id, tx, ty)
-            return False
+                ok = controller.place(bot_id, tx, ty)
+                return (ok, f"PLACE at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+            return False, "PLACE failed: could not move to target"
 
         elif action.action_type == ActionType.PICKUP:
             if bot_info.get('holding'):
-                return False  # Already holding something
+                return False, "PICKUP failed: bot is already holding something"
             if self.move_towards(controller, bot_id, tx, ty):
-                return controller.pickup(bot_id, tx, ty)
-            return False
+                ok = controller.pickup(bot_id, tx, ty)
+                return (ok, f"PICKUP at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+            return False, "PICKUP failed: could not move to target"
 
         elif action.action_type == ActionType.CHOP:
             if bot_info.get('holding'):
-                return False  # Must have empty hands to chop
+                return False, "CHOP failed: bot must have empty hands"
             if self.move_towards(controller, bot_id, tx, ty):
-                return controller.chop(bot_id, tx, ty)
-            return False
+                ok = controller.chop(bot_id, tx, ty)
+                return (ok, f"CHOP at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+            return False, "CHOP failed: could not move to target"
 
         elif action.action_type == ActionType.TAKE_FROM_PAN:
             if bot_info.get('holding'):
-                return False
+                return False, "TAKE_FROM_PAN failed: bot is already holding something"
             if self.move_towards(controller, bot_id, tx, ty):
-                return controller.take_from_pan(bot_id, tx, ty)
-            return False
+                ok = controller.take_from_pan(bot_id, tx, ty)
+                return (ok, f"TAKE_FROM_PAN at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+            return False, "TAKE_FROM_PAN failed: could not move to target"
+
+        elif action.action_type == ActionType.TRASH:
+            if self.move_towards(controller, bot_id, tx, ty):
+                ok = controller.trash(bot_id, tx, ty)
+                return (ok, f"TRASH at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+            return False, "TRASH failed: could not move to target"
 
         elif action.action_type == ActionType.ADD_TO_PLATE:
-            if not bot_info.get('holding'):
-                return False  # Need food to add
-            if self.move_towards(controller, bot_id, tx, ty):
-                return controller.add_food_to_plate(bot_id, tx, ty)
-            return False
+            tile = controller.get_tile(controller.get_team(), tx, ty)
+            if tile is None:
+                return False, "ADD_TO_PLATE failed: no tile at target"
+            if isinstance(tile.item, Food):
+                if self.move_towards(controller, bot_id, tx, ty):
+                    if (bot_info.get('holding') or {}).get('type') == 'Plate':
+                        ok = controller.add_food_to_plate(bot_id, tx, ty)
+                        return (ok, f"ADD_TO_PLATE at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+                    return False, "ADD_TO_PLATE failed: bot must be holding a plate to add food from counter"
+                return False, "ADD_TO_PLATE failed: could not move to target"
+            elif isinstance(tile.item, Plate):
+                if bot_info.get('holding') and (bot_info.get('holding') or {}).get('type') == 'food':
+                    return False, "ADD_TO_PLATE failed: bot must have empty hands to add food to plate on counter"
+                if self.move_towards(controller, bot_id, tx, ty):
+                    ok = controller.add_food_to_plate(bot_id, tx, ty)
+                    return (ok, f"ADD_TO_PLATE at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+                return False, "ADD_TO_PLATE failed: could not move to target"
+            return False, "ADD_TO_PLATE failed: target tile has no Food or Plate"
 
         elif action.action_type == ActionType.SUBMIT:
             if self.move_towards(controller, bot_id, tx, ty):
-                return controller.submit(bot_id, tx, ty)
-            return False
+                ok = controller.submit(bot_id, tx, ty)
+                return (ok, f"SUBMIT at ({tx},{ty}): {'ok' if ok else 'controller refused'}")
+            return False, "SUBMIT failed: could not move to target"
 
-        return False
+        return False, f"execute_action: unknown action type {getattr(action.action_type, 'name', action.action_type)}"
 
     def execute_session(self, controller: RobotController, bot_id: int,
-                        session: Session) -> bool:
+                        session: Session, target: Optional[Tuple[int, int]] = None) -> Tuple[bool, str]:
         """
-        Execute the current action in a session.
-        Returns True if the entire session is completed.
+        Execute the current action in a session. Target is resolved dynamically if not provided.
+        Returns (True, message) if the action completed, (False, message) with reason otherwise.
         """
         action = session.get_current_action()
         if action is None:
-            return True  # Session complete
-
-        if self.execute_action(controller, bot_id, action):
-            return session.advance_action()
-        return False
+            return False, "execute_session: no current action in session"
+        if target is None:
+            return False, "execute_session: target not provided (must be resolved with order context)"
+        ok, msg = self.execute_action(controller, bot_id, action, target)
+        if ok:
+            session.advance_action()
+            return True, msg
+        return False, msg
 
     def ensure_pan_on_cooker(self, controller: RobotController, bot_id: int,
-                             worker: BotWorker) -> bool:
-        """Ensure pan is on cooker. Returns True if ready."""
-        kx, ky = self.cooker_loc
+                             worker: BotWorker, order: DIYOrder) -> bool:
+        """Ensure pan is on cooker. Returns True if ready. Uses dynamic cooker/shop location."""
+        bot_info = controller.get_bot_state(bot_id)
+        bx, by = bot_info['x'], bot_info['y']
+        cooker = order.reserved_pan_pos
+        if cooker is None:
+            return False
+        kx, ky = cooker
         tile = controller.get_tile(controller.get_team(), kx, ky)
 
         if tile and isinstance(tile.item, Pan):
-            worker.pan_placed = True
-            return True
+            if tile.item.food:
+                # Take food from the pan (use take_from_pan, not pickup)
+                if self.move_towards(controller, bot_id, kx, ky):
+                    if controller.take_from_pan(bot_id, kx, ky):
+                        worker.in_ensure_pan_or_cooker = False
+                        return True
+                return False
+            else:
+                worker.in_ensure_pan_or_cooker = False
+                return True
 
-        # Need to place pan - create a one-time session
-        bot_info = controller.get_bot_state(bot_id)
         holding = bot_info.get('holding')
-
         if holding and holding.get('type') == 'Pan':
+            if holding.get('food'):
+                worker.in_ensure_pan_or_cooker = False
+                return False
             if self.move_towards(controller, bot_id, kx, ky):
                 if controller.place(bot_id, kx, ky):
-                    worker.pan_placed = True
+                    worker.in_ensure_pan_or_cooker = False
                     return True
         else:
-            sx, sy = self.shop_loc
+            shop = self.resource_manager.find_nearest_tile(
+                controller, bx, by, 'SHOP') if self.resource_manager else None
+            if shop is None:
+                return False
+            sx, sy = shop
             if self.move_towards(controller, bot_id, sx, sy):
                 if controller.get_team_money(controller.get_team()) >= ShopCosts.PAN.buy_cost:
                     controller.buy(bot_id, ShopCosts.PAN, sx, sy)
         return False
 
     def ensure_plate_on_counter(self, controller: RobotController, bot_id: int,
-                                worker: BotWorker) -> bool:
-        """Ensure plate is on counter. Returns True if ready."""
-        cx, cy = self.counter_loc
+                                worker: BotWorker, order: DIYOrder) -> bool:
+        """Ensure plate is on counter. Returns True if ready. Uses dynamic counter/shop location."""
+        bot_info = controller.get_bot_state(bot_id)
+        bx, by = bot_info['x'], bot_info['y']
+        counter = order.reserved_counter_pos
+        if counter is None:
+            return False
+        cx, cy = counter
         tile = controller.get_tile(controller.get_team(), cx, cy)
 
         if tile and isinstance(tile.item, Plate) and not tile.item.dirty:
-            worker.plate_placed = True
+            worker.in_ensure_pan_or_cooker = False
             return True
 
-        bot_info = controller.get_bot_state(bot_id)
         holding = bot_info.get('holding')
-
         if holding and holding.get('type') == 'Plate':
+            if holding.get('dirty'):
+                worker.in_ensure_pan_or_cooker = False
+                return False
             if self.move_towards(controller, bot_id, cx, cy):
                 if controller.place(bot_id, cx, cy):
-                    worker.plate_placed = True
+                    worker.in_ensure_pan_or_cooker = False
                     return True
         else:
-            sx, sy = self.shop_loc
+            shop = self.resource_manager.find_nearest_tile(
+                controller, bx, by, 'SHOP') if self.resource_manager else None
+            if shop is None:
+                return False
+            sx, sy = shop
             if self.move_towards(controller, bot_id, sx, sy):
                 if controller.get_team_money(controller.get_team()) >= ShopCosts.PLATE.buy_cost:
                     controller.buy(bot_id, ShopCosts.PLATE, sx, sy)
+        return False
+
+    def submit_order(self, controller: RobotController, bot_id: int, worker: BotWorker, order: DIYOrder) -> bool:
+        """Submit the order. Returns True if submit succeeded."""
+        bot_info = controller.get_bot_state(bot_id)
+        bx, by = bot_info['x'], bot_info['y']
+
+        # Make sure the plate is picked up
+        if not bot_info.get('holding') or bot_info.get('holding').get('type') != 'Plate':
+            counter = order.reserved_counter_pos
+            if counter is not None:
+                cx, cy = counter
+                if self.move_towards(controller, bot_id, cx, cy):
+                    if controller.pickup(bot_id, cx, cy):
+                        return False
+            return False
+
+        submit_tile = self.resource_manager.find_nearest_tile(
+            controller, bx, by, 'SUBMIT')
+        if submit_tile is not None:
+            sx, sy = submit_tile
+            if self.move_towards(controller, bot_id, sx, sy):
+                if controller.submit(bot_id, sx, sy):
+                    worker.in_submit_order = False
+                    return True
+            return False
+        worker.in_submit_order = False
         return False
 
     def run_bot(self, controller: RobotController, bot_id: int) -> None:
@@ -1142,91 +1690,146 @@ class BotPlayer:
             self.workers[bot_id] = BotWorker(bot_id=bot_id)
         worker = self.workers[bot_id]
 
-        # If idle, get a new order
-        if worker.is_idle():
-            order = self.scheduler.get_next_order()
-            if order:
-                worker.assign_order(order)
-                self.scheduler.assign_order(order.order_id, bot_id)
-                foods_str = ", ".join(f.food_name for f in order.required_foods)
-                print(f"[Turn {turn}] Bot {bot_id}: Assigned order {order.order_id} ({foods_str})")
-
-        if worker.is_idle():
-            print(f"[Turn {turn}] Bot {bot_id}: IDLE (no orders)")
-            return
-
-        order = worker.current_order
-
-        # Check if order needs cooking - ensure pan is ready FIRST
-        needs_cooking = any(f.can_cook for f in order.required_foods)
-        if needs_cooking and not worker.pan_placed:
-            print(f"[Turn {turn}] Bot {bot_id}: Ensuring pan on cooker...")
-            if not self.ensure_pan_on_cooker(controller, bot_id, worker):
+        # If the hand is holding something, trash it
+        if not worker.is_busy():
+            robot_info = controller.get_bot_state(bot_id)
+            bx, by = robot_info.get('x'), robot_info.get('y')
+            if robot_info.get('holding'):
+                # trash() requires a TRASH tile target, not BOX
+                trash_tile = self.resource_manager.find_nearest_tile(
+                    controller, bx, by, 'TRASH')
+                if trash_tile is not None:
+                    tx, ty = trash_tile
+                    if self.move_towards(controller, bot_id, tx, ty):
+                        if controller.trash(bot_id, tx, ty):
+                            return
                 return
 
-        # Get next available session (priority-based)
-        session = order.get_next_session(turn)
+        # Only consider orders this bot may work on (unassigned or assigned to this bot)
+        active_orders = self.scheduler.get_active_orders_for_bot(bot_id)
+        if not active_orders:
+            # Try to start a new pending order (one robot per order)
+            robot_info = controller.get_bot_state(bot_id)
+            start_loc = (robot_info['x'], robot_info['y']
+                         ) if robot_info else None
+            order = self.scheduler.get_highest_pending_order()
+            if order and self.scheduler.start_order(order.order_id, start_loc, bot_id):
+                foods_str = ", ".join(
+                    f.food_name for f in order.required_foods)
+                print(
+                    f"[Turn {turn}] Scheduler: Bot {bot_id} started order {order.order_id} ({foods_str})")
+                active_orders = [order]
 
-        if session:
-            # Check if this session needs plate - ensure plate is ready
-            needs_plate = session.session_type in [
-                SessionType.BUY_AND_PLATE_SIMPLE,
-                SessionType.BUY_CHOP_AND_PLATE,
-                SessionType.TAKE_AND_PLATE_COOKED,
-                SessionType.BUY_AND_PLACE_PLATE
-            ]
-            if needs_plate and not worker.plate_placed:
-                print(f"[Turn {turn}] Bot {bot_id}: Ensuring plate on counter...")
-                if not self.ensure_plate_on_counter(controller, bot_id, worker):
-                    return
+        for order in active_orders:
+            # Get next available session (priority-based)
+            result = order.get_next_session(turn)
+            if result is None:
+                # No more sessions - if order is fully prepared, submit the plate
+                if order.all_foods_prepared():
+                    worker.in_submit_order = True
+                    if self.submit_order(controller, bot_id, worker, order):
+                        self.scheduler.complete_order(order.order_id)
+                        print(
+                            f"[Turn {turn}] Bot {bot_id}: Order {order.order_id} submitted!")
+                    else:
+                        print(
+                            f"[Turn {turn}] Bot {bot_id}: All foods ready, submitting order {order.order_id}...")
+                continue
+            session, food = result
 
-            food = order.get_food_for_session(session)
-            food_name = food.food_name if food else "?"
-            action = session.get_current_action()
-            action_str = f"{action.action_type.name} @ {action.target_coord}" if action else "None"
-            print(f"[Turn {turn}] Bot {bot_id}: Session={session.session_type.name}, "
-                  f"Food={food_name}, Action={action_str}")
+            if session:
+                # Claim this order if not yet assigned (one robot per order)
+                if order.assigned_bot_id is None:
+                    order.assigned_bot_id = bot_id
+                # Check if this session needs plate - ensure plate is ready
+                needs_plate = session.session_type in [
+                    SessionType.BUY_AND_PLATE_SIMPLE,
+                    SessionType.TAKE_AND_PLATE_COOKED,
+                ]
+                if needs_plate and order.reserved_counter_pos is not None:
+                    # Check the order reserved counter has a plate
+                    cx, cy = order.reserved_counter_pos
+                    plate_tile = controller.get_tile(
+                        controller.get_team(), cx, cy)
+                    if plate_tile is None:
+                        self.scheduler.complete_order(order.order_id)
+                        return
+                    if not isinstance(plate_tile.item, Plate) or plate_tile.item.dirty:
+                        print(f"[Turn {turn}] Bot {bot_id}: Plate not ready at {cx}, {cy}")
+                        worker.in_ensure_pan_or_cooker = True
+                        self.ensure_plate_on_counter(
+                            controller, bot_id, worker, order)
 
-            # Execute current session
-            if self.execute_session(controller, bot_id, session):
-                print(f"[Turn {turn}] Bot {bot_id}: Session COMPLETED!")
+                # Check if this session need pan - ensure pan is ready
+                needs_pan = session.session_type in [
+                    SessionType.BUY_CHOP_AND_COOK, SessionType.BUY_AND_COOK]
+                if needs_pan and order.reserved_pan_pos is not None:
+                    cx, cy = order.reserved_pan_pos
+                    cooker_tile = controller.get_tile(
+                        controller.get_team(), cx, cy)
+                    if cooker_tile is None:
+                        self.scheduler.complete_order(order.order_id)
+                        return
+                    has_empty_pan = (
+                        getattr(cooker_tile, "item", None) is not None
+                        and isinstance(cooker_tile.item, Pan)
+                        and cooker_tile.item.food is None
+                    )
+                    if not has_empty_pan:
+                        print(f"[Turn {turn}] Bot {bot_id}: Pan not ready at {cx}, {cy}")
+                        worker.in_ensure_pan_or_cooker = True
+                        self.ensure_pan_on_cooker(controller, bot_id, worker, order)
 
-                # Advance the food's session tracking
-                if food:
-                    food.advance_session()
-                    if food.is_prepared:
-                        print(f"[Turn {turn}] Bot {bot_id}: {food_name} is fully prepared!")
+                worker.current_session = session
 
-                # If this was a cooking session, set the cook ready time
-                if session.session_type in [SessionType.BUY_CHOP_AND_COOK, SessionType.BUY_AND_COOK]:
-                    # Find the TAKE_AND_PLATE_COOKED session for this food
+                food_name = food.food_name if food else None
+                action = session.get_current_action()
+                target = self._resolve_target_for_action(
+                    controller, bot_id, session, order)
+                action_str = f"{action.action_type.name} @ {target}" if action else "None"
+                print(f"[Turn {turn}] Bot {bot_id}: Session={session.session_type.name}, "
+                      f"Food={food_name}, Action={action_str}")
+
+                # Execute current session with dynamic target
+                action_ok, action_msg = self.execute_session(
+                    controller, bot_id, session, target)
+                print(f"[Turn {turn}] Bot {bot_id}: {action_msg}")
+
+                if session.completed:
+                    worker.current_session = None
+                    print(f"[Turn {turn}] Bot {bot_id}: Session COMPLETED!")
+
+                    # Advance the food's session tracking
                     if food:
-                        for s in food.sessions:
-                            if s.session_type == SessionType.TAKE_AND_PLATE_COOKED:
-                                s.available_after_turn = turn + GameConstants.COOK_PROGRESS
-                                print(f"[Turn {turn}] Bot {bot_id}: {food_name} will be ready at turn {s.available_after_turn}")
-                                break
-        else:
-            # No available sessions - check if all foods are prepared
-            if order.all_foods_prepared():
-                print(f"[Turn {turn}] Bot {bot_id}: All foods ready, submitting...")
-                bot_info = controller.get_bot_state(bot_id)
-                holding = bot_info.get('holding')
-                cx, cy = self.counter_loc
-                ux, uy = self.submit_loc
+                        food.advance_session()
+                        if food.is_prepared:
+                            print(
+                                f"[Turn {turn}] Bot {bot_id}: {food_name} is fully prepared!")
 
-                if not holding:
-                    if self.move_towards(controller, bot_id, cx, cy):
-                        controller.pickup(bot_id, cx, cy)
-                else:
-                    if self.move_towards(controller, bot_id, ux, uy):
-                        if controller.submit(bot_id, ux, uy):
-                            print(f"[Turn {turn}] Bot {bot_id}: ORDER {order.order_id} SUBMITTED!")
-                            self.scheduler.complete_order(order.order_id)
-                            worker.finish_order()
+                    # If this was a cooking session, set the cook ready time
+                    if session.session_type in [SessionType.BUY_CHOP_AND_COOK, SessionType.BUY_AND_COOK]:
+                        # Find the TAKE_AND_PLATE_COOKED session for this food
+                        if food:
+                            for s in food.sessions:
+                                if s.session_type == SessionType.TAKE_AND_PLATE_COOKED:
+                                    s.available_after_turn = turn + GameConstants.COOK_PROGRESS
+                                    print(
+                                        f"[Turn {turn}] Bot {bot_id}: {food_name} will be ready at turn {s.available_after_turn}")
+                                    break
+                break  # One session per bot per turn
             else:
-                # Waiting for something (cooking)
-                print(f"[Turn {turn}] Bot {bot_id}: Waiting (cooking in progress)...")
+                # No available sessions - check if all foods are prepared
+                if order.all_foods_prepared():
+                    # Submit the order
+                    worker.in_submit_order = True
+                    self.submit_order(controller, bot_id, worker, order)
+                    print(
+                        f"[Turn {turn}] Bot {bot_id}: All foods ready, queuing submit...")
+                else:
+                    # Waiting for something (cooking)
+                    print(
+                        f"[Turn {turn}] Bot {bot_id}: Waiting (cooking in progress)...")
+                break  # One decision per bot per turn
 
     def play_turn(self, controller: RobotController):
         """Main entry point - called each turn."""
@@ -1237,12 +1840,8 @@ class BotPlayer:
         # Initialize/update route calculator for this turn
         self._init_route_calculator(controller)
 
-        # Initialize locations using first bot
-        bot_info = controller.get_bot_state(my_bots[0])
-        bx, by = bot_info['x'], bot_info['y']
-
-        if not self.initialize_locations(controller, bx, by):
-            return
+        # Update resource manager each round (status, auto-release cookers, etc.)
+        self._init_resource_manager(controller)
 
         # Update scheduler with new orders
         self.scheduler.receive_orders(controller, controller.get_turn())

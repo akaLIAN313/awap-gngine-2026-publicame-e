@@ -1727,16 +1727,16 @@ class BotPlayer:
         bx, by = bot_info['x'], bot_info['y']
 
         # Holding a empty plate, so we need to pick up the food on the counter
-        if bot_info.get('holding') and bot_info.get('holding').get('type') == 'Plate' and bot_info.get('holding').get('food') is None:
+        if bot_info.get('holding') and bot_info.get('holding').get('type') == 'Plate' and not bot_info.get('holding').get('food'):
             counter = order.reserved_counter_pos
             if counter is not None:
                 cx, cy = counter
                 if self.move_towards(controller, bot_id, cx, cy):
-                    if controller.pickup(bot_id, cx, cy):
+                    if controller.add_food_to_plate(bot_id, cx, cy):
                         return False
             return False
         
-        if bot_info.get('holding') and bot_info.get('holding').get('type') == 'Plate' and bot_info.get('holding').get('food') is not None:
+        if bot_info.get('holding') and bot_info.get('holding').get('type') == 'Plate' and bot_info.get('holding').get('food'):
             submit_tile = self.resource_manager.find_nearest_tile(
                 controller, bx, by, 'SUBMIT')
             if submit_tile is not None:

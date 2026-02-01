@@ -777,7 +777,7 @@ class Session:
             ],
             priority=2  # After cooking starts, before adding food
         )
-    
+
     @staticmethod
     def create_buy_chop_and_cook(food_type: FoodType) -> 'Session':
         """Create session: Buy -> place -> chop -> pickup -> place in cooker. Target coords set dynamically at action time."""
@@ -793,7 +793,7 @@ class Session:
             food_type=food_type,
             priority=3  # High priority - start cooking early
         )
-    
+
     @staticmethod
     def create_buy_and_cook(food_type: FoodType) -> 'Session':
         """Create session: Buy -> place in cooker (no chop). Target coords set dynamically at action time."""
@@ -806,7 +806,7 @@ class Session:
             food_type=food_type,
             priority=4  # High priority - start cooking early
         )
-    
+
     @staticmethod
     def create_take_and_plate_cooked(food_type: FoodType) -> 'Session':
         """Create session: Take from pan -> add to plate (when cooked). Target coords set dynamically at action time."""
@@ -820,7 +820,7 @@ class Session:
             available_after_turn=None,  # Will be set when cooking starts
             priority=5  # Lower priority - do after other prep
         )
-    
+
     @staticmethod
     def create_buy_chop(food_type: FoodType) -> 'Session':
         """Create session: Buy -> place -> chop. Target coords set dynamically at action time."""
@@ -1262,6 +1262,9 @@ class Scheduler:
             if order.reserved_counter_pos and self.resource_manager:
                 self.resource_manager.release_counter(
                     order.reserved_counter_pos)
+            if order.reserved_pan_pos and self.resource_manager:
+                self.resource_manager.release_cooker(
+                    order.reserved_pan_pos)
             order.is_completed = True
             order.assigned_bot_id = None
             self.orders.remove(order)
@@ -1308,11 +1311,12 @@ class BotWorker:
     bot_id: int
     current_order: Optional[DIYOrder] = None
     current_session: Optional[Session] = None
-    in_ensure_pan_or_cooker: bool = False
+    in_ensure_plate: bool = False
+    in_ensure_pan: bool = False
     in_submit_order: bool = False
 
     def is_busy(self) -> bool:
-        return self.in_ensure_pan_or_cooker or self.in_submit_order or self.current_session is not None
+        return self.in_ensure_plate or self.in_ensure_pan or self.in_submit_order or self.current_session is not None
 
     def finish_order(self) -> None:
         """Mark order as complete and reset to idle."""
@@ -1320,7 +1324,15 @@ class BotWorker:
             self.current_order.is_completed = True
         self.current_order = None
         self.current_session = None
-        self.in_ensure_pan_or_cooker = False
+        self.in_ensure_plate = False
+        self.in_ensure_pan = False
+        self.in_submit_order = False
+
+    def clear_state(self) -> None:
+        self.current_order = None
+        self.current_session = None
+        self.in_ensure_plate = False
+        self.in_ensure_pan = False
         self.in_submit_order = False
 
 
@@ -1603,36 +1615,50 @@ class BotPlayer:
         kx, ky = cooker
         tile = controller.get_tile(controller.get_team(), kx, ky)
 
-        if tile and isinstance(tile.item, Pan):
-            if tile.item.food:
-                # Take food from the pan (use take_from_pan, not pickup)
+        holding = bot_info.get('holding')
+
+        if holding:
+            if holding.get('type') == 'Food':
+                trash_tile = self.resource_manager.find_nearest_tile(
+                    controller, bx, by, 'TRASH')
+                if trash_tile is not None:
+                    tx, ty = trash_tile
+                    if self.move_towards(controller, bot_id, tx, ty):
+                        if controller.trash(bot_id, tx, ty):
+                            return True
+                return False
+            if holding.get('type') == 'Pan':
                 if self.move_towards(controller, bot_id, kx, ky):
-                    if controller.take_from_pan(bot_id, kx, ky):
-                        worker.in_ensure_pan_or_cooker = False
+                    if controller.place(bot_id, kx, ky):
+                        worker.in_ensure_pan = False
                         return True
                 return False
-            else:
-                worker.in_ensure_pan_or_cooker = False
-                return True
 
-        holding = bot_info.get('holding')
-        if holding and holding.get('type') == 'Pan':
-            if holding.get('food'):
-                worker.in_ensure_pan_or_cooker = False
+        if tile:
+            if tile.item is None:
+                shop = self.resource_manager.find_nearest_tile(
+                    controller, bx, by, 'SHOP') if self.resource_manager else None
+                if shop is None:
+                    return False
+                sx, sy = shop
+                if self.move_towards(controller, bot_id, sx, sy):
+                    if controller.get_team_money(controller.get_team()) >= ShopCosts.PAN.buy_cost:
+                        controller.buy(bot_id, ShopCosts.PAN, sx, sy)
                 return False
-            if self.move_towards(controller, bot_id, kx, ky):
-                if controller.place(bot_id, kx, ky):
-                    worker.in_ensure_pan_or_cooker = False
+            if isinstance(tile.item, Pan):
+                if tile.item.food:
+                    # Take food from the pan (use take_from_pan, not pickup)
+                    if self.move_towards(controller, bot_id, kx, ky):
+                        if controller.take_from_pan(bot_id, kx, ky):
+                            return False
+                    return False
+                else:
+                    worker.in_ensure_pan = False
                     return True
-        else:
-            shop = self.resource_manager.find_nearest_tile(
-                controller, bx, by, 'SHOP') if self.resource_manager else None
-            if shop is None:
-                return False
-            sx, sy = shop
-            if self.move_towards(controller, bot_id, sx, sy):
-                if controller.get_team_money(controller.get_team()) >= ShopCosts.PAN.buy_cost:
-                    controller.buy(bot_id, ShopCosts.PAN, sx, sy)
+            else:
+                if self.move_towards(controller, bot_id, kx, ky):
+                    if controller.pickup(bot_id, kx, ky):
+                        return False
         return False
 
     def ensure_plate_on_counter(self, controller: RobotController, bot_id: int,
@@ -1647,13 +1673,13 @@ class BotPlayer:
         tile = controller.get_tile(controller.get_team(), cx, cy)
 
         if tile and isinstance(tile.item, Plate) and not tile.item.dirty:
-            worker.in_ensure_pan_or_cooker = False
+            worker.in_ensure_plate = False
             return True
 
         holding = bot_info.get('holding')
         if holding and holding.get('type') == 'Plate':
             if holding.get('dirty'):
-                worker.in_ensure_pan_or_cooker = False
+                worker.in_ensure_plate = False
                 return False
             if self.move_towards(controller, bot_id, cx, cy):
                 # Food on the counter
@@ -1670,7 +1696,7 @@ class BotPlayer:
                         return False, "PLACE failed: target tile is not food"
 
                 if controller.place(bot_id, cx, cy):
-                    worker.in_ensure_pan_or_cooker = False
+                    worker.in_ensure_plate = False
                     return True
         else:
             shop = self.resource_manager.find_nearest_tile(
@@ -1709,7 +1735,7 @@ class BotPlayer:
             return False
         worker.in_submit_order = False
         return False
-
+    
     def run_bot(self, controller: RobotController, bot_id: int) -> None:
         """Run a single bot's turn using session-based scheduling."""
         turn = controller.get_turn()
@@ -1718,6 +1744,14 @@ class BotPlayer:
         if bot_id not in self.workers:
             self.workers[bot_id] = BotWorker(bot_id=bot_id)
         worker = self.workers[bot_id]
+
+        if worker.current_session is not None and worker.current_session.completed:
+            worker.current_session = None
+        # If the order assigned to this bot is completed, release the counter and pan
+        if worker.current_order is not None:
+            if worker.current_order.is_completed or worker.current_order.is_expired(turn):
+                self.scheduler.complete_order(worker.current_order.order_id)
+                worker.clear_state()
 
         # If the hand is holding something, trash it
         if not worker.is_busy():
@@ -1733,135 +1767,164 @@ class BotPlayer:
                         if controller.trash(bot_id, tx, ty):
                             return
                 return
-
-        # Only consider orders this bot may work on (unassigned or assigned to this bot)
-        active_orders = self.scheduler.get_active_orders_for_bot(bot_id)
-        if not active_orders:
-            # Try to start a new pending order (one robot per order)
-            robot_info = controller.get_bot_state(bot_id)
-            start_loc = (robot_info['x'], robot_info['y']
-                         ) if robot_info else None
+        
+        if worker.current_order is None:
             order = self.scheduler.get_highest_pending_order()
-            if order and self.scheduler.start_order(order.order_id, start_loc, bot_id):
-                foods_str = ", ".join(
-                    f.food_name for f in order.required_foods)
-                print(
-                    f"[Turn {turn}] Scheduler: Bot {bot_id} started order {order.order_id} ({foods_str})")
-                active_orders = [order]
-
-        for order in active_orders:
-            # Get next available session (priority-based)
-            result = order.get_next_session(turn)
-            if result is None:
-                # No more sessions - if order is fully prepared, submit the plate
-                if order.all_foods_prepared():
-                    worker.in_submit_order = True
-                    if self.submit_order(controller, bot_id, worker, order):
-                        self.scheduler.complete_order(order.order_id)
-                        print(
-                            f"[Turn {turn}] Bot {bot_id}: Order {order.order_id} submitted!")
-                    else:
-                        print(
-                            f"[Turn {turn}] Bot {bot_id}: All foods ready, submitting order {order.order_id}...")
-                continue
-            session, food = result
-
-            if session:
-                # Claim this order if not yet assigned (one robot per order)
-                if order.assigned_bot_id is None:
-                    order.assigned_bot_id = bot_id
-                # Check if this session needs plate - ensure plate is ready
-                needs_plate = session.session_type in [
-                    SessionType.BUY_AND_PLATE_SIMPLE,
-                    SessionType.TAKE_AND_PLATE_COOKED,
-                ]
-                if needs_plate and order.reserved_counter_pos is not None:
-                    # Check the order reserved counter has a plate
-                    cx, cy = order.reserved_counter_pos
-                    plate_tile = controller.get_tile(
-                        controller.get_team(), cx, cy)
-                    if plate_tile is None:
-                        self.scheduler.complete_order(order.order_id)
-                        return
-                    if not isinstance(plate_tile.item, Plate) or plate_tile.item.dirty:
-                        print(
-                            f"[Turn {turn}] Bot {bot_id}: Plate not ready at {cx}, {cy}")
-                        worker.in_ensure_pan_or_cooker = True
-                        self.ensure_plate_on_counter(
-                            controller, bot_id, worker, order)
-
-                # Check if this session need pan - ensure pan is ready
-                needs_pan = session.session_type in [
-                    SessionType.BUY_CHOP_AND_COOK, SessionType.BUY_AND_COOK]
-                if needs_pan and order.reserved_pan_pos is not None:
-                    cx, cy = order.reserved_pan_pos
-                    cooker_tile = controller.get_tile(
-                        controller.get_team(), cx, cy)
-                    if cooker_tile is None:
-                        self.scheduler.complete_order(order.order_id)
-                        return
-                    has_empty_pan = (
-                        getattr(cooker_tile, "item", None) is not None
-                        and isinstance(cooker_tile.item, Pan)
-                        and cooker_tile.item.food is None
-                    )
-                    if not has_empty_pan:
-                        print(
-                            f"[Turn {turn}] Bot {bot_id}: Pan not ready at {cx}, {cy}")
-                        worker.in_ensure_pan_or_cooker = True
-                        self.ensure_pan_on_cooker(
-                            controller, bot_id, worker, order)
-
-                worker.current_session = session
-
-                food_name = food.food_name if food else None
-                action = session.get_current_action()
-                target = self._resolve_target_for_action(
-                    controller, bot_id, session, order)
-                action_str = f"{action.action_type.name} @ {target}" if action else "None"
-                print(f"[Turn {turn}] Bot {bot_id}: Session={session.session_type.name}, "
-                      f"Food={food_name}, Action={action_str}")
-
-                # Execute current session with dynamic target
-                action_ok, action_msg = self.execute_session(
-                    controller, bot_id, session, target)
-                print(f"[Turn {turn}] Bot {bot_id}: {action_msg}")
-
-                if session.completed:
-                    worker.current_session = None
-                    print(f"[Turn {turn}] Bot {bot_id}: Session COMPLETED!")
-
-                    # Advance the food's session tracking
-                    if food:
-                        food.advance_session()
-                        if food.is_prepared:
-                            print(
-                                f"[Turn {turn}] Bot {bot_id}: {food_name} is fully prepared!")
-
-                    # If this was a cooking session, set the cook ready time
-                    if session.session_type in [SessionType.BUY_CHOP_AND_COOK, SessionType.BUY_AND_COOK]:
-                        # Find the TAKE_AND_PLATE_COOKED session for this food
-                        if food:
-                            for s in food.sessions:
-                                if s.session_type == SessionType.TAKE_AND_PLATE_COOKED:
-                                    s.available_after_turn = turn + GameConstants.COOK_PROGRESS
-                                    print(
-                                        f"[Turn {turn}] Bot {bot_id}: {food_name} will be ready at turn {s.available_after_turn}")
-                                    break
-                break  # One session per bot per turn
-            else:
-                # No available sessions - check if all foods are prepared
-                if order.all_foods_prepared():
-                    # Submit the order
-                    worker.in_submit_order = True
-                    self.submit_order(controller, bot_id, worker, order)
+            if order is not None:
+                if self.scheduler.start_order(order.order_id, (bx, by), bot_id):
+                    worker.clear_state()
+                    worker.current_order = order
+                    foods_str = ", ".join(
+                        f.food_name for f in order.required_foods)
                     print(
-                        f"[Turn {turn}] Bot {bot_id}: All foods ready, queuing submit...")
+                        f"[Turn {turn}] Scheduler: Bot {bot_id} started order {order.order_id} ({foods_str})")
                 else:
-                    # Waiting for something (cooking)
+                    return
+            else:
+                return
+        else:
+            order = worker.current_order
+        
+        if order is None:
+            worker.clear_state()
+            return
+        
+        # If the bot is ensuring the plate is on the counter, ensure it is ready
+        if worker.in_ensure_plate:
+            if self.ensure_plate_on_counter(controller, bot_id, worker, worker.current_order):
+                worker.in_ensure_plate = False
+            return
+        
+        # If the bot is ensuring the pan is ready, ensure it is ready
+        if worker.in_ensure_pan:
+            if self.ensure_pan_on_cooker(controller, bot_id, worker, worker.current_order):
+                worker.in_ensure_pan = False
+            return
+        
+        # If the bot is submitting the order, submit it
+        if worker.in_submit_order:
+            if self.submit_order(controller, bot_id, worker, worker.current_order):
+                worker.in_submit_order = False
+                self.scheduler.complete_order(worker.current_order.order_id)
+                worker.clear_state()
+            return
+        
+        result = order.get_next_session(turn)
+        
+        session, food = result if result is not None else (None, None)
+
+        if session:
+            # Claim this order if not yet assigned (one robot per order)
+            if order.assigned_bot_id is None:
+                order.assigned_bot_id = bot_id
+            # Check if this session needs plate - ensure plate is ready
+            needs_plate = session.session_type in [
+                SessionType.BUY_AND_PLATE_SIMPLE,
+                SessionType.TAKE_AND_PLATE_COOKED,
+            ]
+            if needs_plate and order.reserved_counter_pos is not None:
+                # Check the order reserved counter has a plate
+                cx, cy = order.reserved_counter_pos
+                plate_tile = controller.get_tile(
+                    controller.get_team(), cx, cy)
+                if plate_tile is None:
+                    self.scheduler.complete_order(order.order_id)
+                    worker.clear_state()
+                    return
+                if not isinstance(plate_tile.item, Plate) or plate_tile.item.dirty:
                     print(
-                        f"[Turn {turn}] Bot {bot_id}: Waiting (cooking in progress)...")
-                break  # One decision per bot per turn
+                        f"[Turn {turn}] Bot {bot_id}: Plate not ready at {cx}, {cy}")
+                    worker.in_ensure_plate = True
+                    self.ensure_plate_on_counter(
+                        controller, bot_id, worker, order)
+
+            # Check if this session need pan - ensure pan is ready
+            needs_pan = session.session_type in [
+                SessionType.BUY_CHOP_AND_COOK, SessionType.BUY_AND_COOK]
+            if needs_pan and order.reserved_pan_pos is not None:
+                cx, cy = order.reserved_pan_pos
+                cooker_tile = controller.get_tile(
+                    controller.get_team(), cx, cy)
+                if cooker_tile is None:
+                    self.scheduler.complete_order(order.order_id)
+                    worker.clear_state()
+                    return
+                has_empty_pan = (
+                    getattr(cooker_tile, "item", None) is not None
+                    and isinstance(cooker_tile.item, Pan)
+                    and cooker_tile.item.food is None
+                )
+                if not has_empty_pan:
+                    print(
+                        f"[Turn {turn}] Bot {bot_id}: Pan not ready at {cx}, {cy}")
+                    worker.in_ensure_pan = True
+                    self.ensure_pan_on_cooker(
+                        controller, bot_id, worker, order)
+
+            worker.current_session = session
+
+            food_name = food.food_name if food else None
+            action = session.get_current_action()
+            target = self._resolve_target_for_action(
+                controller, bot_id, session, order)
+            action_str = f"{action.action_type.name} @ {target}" if action else "None"
+            print(f"[Turn {turn}] Bot {bot_id}: Session={session.session_type.name}, "
+                    f"Food={food_name}, Action={action_str}")
+
+            # Execute current session with dynamic target
+            action_ok, action_msg = self.execute_session(
+                controller, bot_id, session, target)
+            print(f"[Turn {turn}] Bot {bot_id}: {action_msg}")
+
+            if session.completed:
+                worker.current_session = None
+                print(f"[Turn {turn}] Bot {bot_id}: Session COMPLETED!")
+
+                # Advance the food's session tracking
+                if food:
+                    food.advance_session()
+                    if food.is_prepared:
+                        print(
+                            f"[Turn {turn}] Bot {bot_id}: {food_name} is fully prepared!")
+
+                # If this was a cooking session, set the cook ready time
+                if session.session_type in [SessionType.BUY_CHOP_AND_COOK, SessionType.BUY_AND_COOK]:
+                    # Find the TAKE_AND_PLATE_COOKED session for this food
+                    if food:
+                        for s in food.sessions:
+                            if s.session_type == SessionType.TAKE_AND_PLATE_COOKED:
+                                s.available_after_turn = turn + GameConstants.COOK_PROGRESS
+                                print(
+                                    f"[Turn {turn}] Bot {bot_id}: {food_name} will be ready at turn {s.available_after_turn}")
+                                break
+            return
+        else:
+            # No available sessions - check if all foods are prepared
+            if order.all_foods_prepared():
+                # Submit the order
+                worker.in_submit_order = True
+                self.submit_order(controller, bot_id, worker, order)
+                print(
+                    f"[Turn {turn}] Bot {bot_id}: All foods ready, queuing submit...")
+            else:
+                # Nothing to do, just ensure the pan
+                cx, cy = order.reserved_counter_pos
+                plate_tile = controller.get_tile(
+                    controller.get_team(), cx, cy)
+                if plate_tile is None:
+                    self.scheduler.complete_order(order.order_id)
+                    return
+                if not isinstance(plate_tile.item, Plate) or plate_tile.item.dirty:
+                    print(
+                        f"[Turn {turn}] Bot {bot_id}: Plate not ready at {cx}, {cy}")
+                    worker.in_ensure_plate = True
+                    self.ensure_plate_on_counter(
+                        controller, bot_id, worker, order)
+                    return
+                # Waiting for something (cooking)
+                print(
+                    f"[Turn {turn}] Bot {bot_id}: Waiting (cooking in progress)...")
+            return  # One decision per bot per turn
 
     def play_turn(self, controller: RobotController):
         """Main entry point - called each turn."""

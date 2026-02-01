@@ -1726,8 +1726,8 @@ class BotPlayer:
         bot_info = controller.get_bot_state(bot_id)
         bx, by = bot_info['x'], bot_info['y']
 
-        # Make sure the plate is picked up
-        if not bot_info.get('holding') or bot_info.get('holding').get('type') != 'Plate':
+        # Holding a empty plate, so we need to pick up the food on the counter
+        if bot_info.get('holding') and bot_info.get('holding').get('type') == 'Plate' and bot_info.get('holding').get('food') is None:
             counter = order.reserved_counter_pos
             if counter is not None:
                 cx, cy = counter
@@ -1735,17 +1735,45 @@ class BotPlayer:
                     if controller.pickup(bot_id, cx, cy):
                         return False
             return False
+        
+        if bot_info.get('holding') and bot_info.get('holding').get('type') == 'Plate' and bot_info.get('holding').get('food') is not None:
+            submit_tile = self.resource_manager.find_nearest_tile(
+                controller, bx, by, 'SUBMIT')
+            if submit_tile is not None:
+                sx, sy = submit_tile
+                if self.move_towards(controller, bot_id, sx, sy):
+                    if controller.submit(bot_id, sx, sy):
+                        worker.in_submit_order = False
+                        return True
+                return False
+            worker.in_submit_order = False
+        
+        # The counter is not a plate, so we need to buy a plate
+        counter = order.reserved_counter_pos
+        # check counter is a plate
+        if counter is not None:
+            cx, cy = counter
+            plate_tile = controller.get_tile(
+                controller.get_team(), cx, cy)
+            if plate_tile is None:
+                return False
+            if not isinstance(plate_tile.item, Plate):
+                # buy a plate
+                shop = self.resource_manager.find_nearest_tile(
+                    controller, bx, by, 'SHOP') if self.resource_manager else None
+                if shop is None:
+                    return False
+                sx, sy = shop
+                if self.move_towards(controller, bot_id, sx, sy):
+                    if controller.get_team_money(controller.get_team()) >= ShopCosts.PLATE.buy_cost:
+                        controller.buy(bot_id, ShopCosts.PLATE, sx, sy)
+                return False
+            else:
+                if self.move_towards(controller, bot_id, cx, cy):
+                    if controller.pickup(bot_id, cx, cy):
+                        return False
+                return False
 
-        submit_tile = self.resource_manager.find_nearest_tile(
-            controller, bx, by, 'SUBMIT')
-        if submit_tile is not None:
-            sx, sy = submit_tile
-            if self.move_towards(controller, bot_id, sx, sy):
-                if controller.submit(bot_id, sx, sy):
-                    worker.in_submit_order = False
-                    return True
-            return False
-        worker.in_submit_order = False
         return False
     
     def run_bot(self, controller: RobotController, bot_id: int) -> None:
@@ -1770,14 +1798,24 @@ class BotPlayer:
             robot_info = controller.get_bot_state(bot_id)
             bx, by = robot_info.get('x'), robot_info.get('y')
             if robot_info.get('holding'):
-                # trash() requires a TRASH tile target, not BOX
-                trash_tile = self.resource_manager.find_nearest_tile(
-                    controller, bx, by, 'TRASH')
-                if trash_tile is not None:
-                    tx, ty = trash_tile
-                    if self.move_towards(controller, bot_id, tx, ty):
-                        if controller.trash(bot_id, tx, ty):
-                            return
+                if robot_info.get('holding').get('type') == 'Food':
+                    trash_tile = self.resource_manager.find_nearest_tile(
+                        controller, bx, by, 'TRASH')
+                    if trash_tile is not None:
+                        tx, ty = trash_tile
+                        if self.move_towards(controller, bot_id, tx, ty):
+                            if controller.trash(bot_id, tx, ty):
+                                return
+                        return
+                elif robot_info.get('holding').get('type') == 'Pan' or robot_info.get('holding').get('type') == 'Plate':
+                    box_tile = self.resource_manager.find_nearest_tile(
+                        controller, bx, by, 'BOX')
+                    if box_tile is not None:
+                        bx, by = box_tile
+                        if self.move_towards(controller, bot_id, bx, by):
+                            if controller.place(bot_id, bx, by):
+                                return
+                        return
                 return
         
         if worker.current_order is None:
@@ -1819,6 +1857,7 @@ class BotPlayer:
             if self.submit_order(controller, bot_id, worker, worker.current_order):
                 worker.in_submit_order = False
                 self.scheduler.complete_order(worker.current_order.order_id)
+                print(f"[Turn {turn}] Bot {bot_id}: Order {worker.current_order.order_id} submitted")
                 worker.clear_state()
             return
         
@@ -1841,6 +1880,7 @@ class BotPlayer:
                 plate_tile = controller.get_tile(
                     controller.get_team(), cx, cy)
                 if plate_tile is None:
+                    print(f"[Turn {turn}] Bot {bot_id}: Plate not found at {cx}, {cy}, ending order {order.order_id}")
                     self.scheduler.complete_order(order.order_id)
                     worker.clear_state()
                     return
@@ -1859,6 +1899,7 @@ class BotPlayer:
                 cooker_tile = controller.get_tile(
                     controller.get_team(), cx, cy)
                 if cooker_tile is None:
+                    print(f"[Turn {turn}] Bot {bot_id}: Pan not found at {cx}, {cy}, ending order {order.order_id}")
                     self.scheduler.complete_order(order.order_id)
                     worker.clear_state()
                     return
@@ -1916,15 +1957,21 @@ class BotPlayer:
             if order.all_foods_prepared():
                 # Submit the order
                 worker.in_submit_order = True
-                self.submit_order(controller, bot_id, worker, order)
                 print(
                     f"[Turn {turn}] Bot {bot_id}: All foods ready, queuing submit...")
+                if self.submit_order(controller, bot_id, worker, order):
+                    worker.in_submit_order = False
+                    self.scheduler.complete_order(worker.current_order.order_id)
+                    print(f"[Turn {turn}] Bot {bot_id}: Order {worker.current_order.order_id} submitted")
+                    worker.clear_state()
+
             else:
                 # Nothing to do, just ensure the pan
                 cx, cy = order.reserved_counter_pos
                 plate_tile = controller.get_tile(
                     controller.get_team(), cx, cy)
                 if plate_tile is None:
+                    print(f"[Turn {turn}] Bot {bot_id}: Plate not found at {cx}, {cy}, ending order {order.order_id}")
                     self.scheduler.complete_order(order.order_id)
                     return
                 if not isinstance(plate_tile.item, Plate) or plate_tile.item.dirty:
